@@ -1,0 +1,26 @@
+# PySide6-Essentials (+shiboken6) instead of the full PySide6 meta-package:
+# the meta-package pulls in PySide6-Addons (WebEngine, Qt3D, QtQuick/QML,
+# Charts, Multimedia, Bluetooth, DBus...) which this app never imports --
+# only QtCore/QtGui/QtWidgets, all of which live in Essentials. Verified the
+# app runs identically without Addons; Essentials-only saves ~430MB installed.
+PySide6-Essentials>=6.7
+shiboken6>=6.7
+rawpy>=0.23.2
+Pillow>=10.3
+opencv-python>=4.10
+numpy>=1.26
+
+# AI object selection (Phase 3). torch/torchvision must come from PyTorch's
+# own CUDA wheel index -- plain PyPI carries CPU-only builds under the same
+# unsuffixed version numbers. --extra-index-url alone does NOT prefer this
+# index; a bare "torch>=2.11" resolves happily to the PyPI CPU build instead
+# (confirmed the hard way: an unpinned install silently picked 2.13.0+cpu).
+# Pinning the exact +cu128 build forces the right one regardless of index
+# resolution order. cu128 is required for Blackwell (RTX 50-series, sm_120)
+# GPU support. These wheels still work fine on non-NVIDIA machines -- CUDA
+# is only touched if a compatible GPU/driver is actually detected at runtime,
+# otherwise everything runs on CPU.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+ultralytics>=8.4
