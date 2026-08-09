@@ -20,5 +20,6 @@ sam2_b.pt
 # Editor/OS cruft
 .vscode/
 .idea/
+.claude/
 Thumbs.db
 .DS_Store
