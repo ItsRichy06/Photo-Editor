@@ -329,6 +329,11 @@ class LibraryView(QWidget):
         self.catalog = catalog
         self.settings = get_settings()
         self.loader_thread = None
+        # Old ThumbnailLoaderThreads being wound down after a folder switch
+        # (see _retire_loader_thread) -- kept referenced here so Python
+        # doesn't garbage-collect the wrapper object while the underlying
+        # QThread is still actually running.
+        self._retiring_threads = []
 
         self.model = PhotoListModel(self)
         self.proxy = PhotoFilterProxy(self)
@@ -434,10 +439,33 @@ class LibraryView(QWidget):
         if folder:
             self.load_folder(folder)
 
+    def _retire_loader_thread(self, thread: "ThumbnailLoaderThread"):
+        """Ask a superseded loader thread to stop and detach it from the UI,
+        without blocking the calling (GUI) thread on it finishing.
+
+        This used to be `thread.stop(); thread.wait()`, which deadlocks: the
+        thread being waited on is Python code (plus rawpy/PIL calls) that
+        needs the GIL to make progress, but QThread.wait() does not release
+        the GIL while the GUI thread blocks in it -- so the old thread can
+        never get the GIL back to actually finish, and the whole app hangs
+        forever (confirmed: no progress after 30+ seconds on a 12-photo
+        folder that normally loads in under a second). Instead, detach its
+        signals so any results it still emits while winding down land on
+        nothing, and keep a reference until it genuinely finishes so Python
+        doesn't garbage-collect the wrapper while the QThread is still alive.
+        """
+        thread.stop()
+        for sig in (thread.scan_registered, thread.photo_ready, thread.finished_scanning):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        self._retiring_threads.append(thread)
+        thread.finished.connect(lambda: self._retiring_threads.remove(thread))
+
     def load_folder(self, folder: str):
         if self.loader_thread and self.loader_thread.isRunning():
-            self.loader_thread.stop()
-            self.loader_thread.wait()
+            self._retire_loader_thread(self.loader_thread)
 
         self.model.clear()
         self.settings.setValue(LAST_LIBRARY_FOLDER, folder)
