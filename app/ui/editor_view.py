@@ -1493,6 +1493,14 @@ class EditorView(QWidget):
                 self.sliders[key] = slider
             layout.addWidget(box)
 
+        curves_box = QGroupBox("Curves")
+        curves_layout = QVBoxLayout(curves_box)
+        curves_layout.setContentsMargins(8, 6, 8, 6)
+        self.curve_editor = widgets.CurveEditor()
+        self.curve_editor.curveChanged.connect(self._on_curve_changed)
+        curves_layout.addWidget(self.curve_editor)
+        layout.addWidget(curves_box)
+
         crop_box = QGroupBox("Crop")
         crop_layout = QVBoxLayout(crop_box)
         crop_layout.setContentsMargins(8, 6, 8, 6)
@@ -1694,6 +1702,18 @@ class EditorView(QWidget):
 
     def _on_adjustment_changed(self, key, value):
         self.recipe[key] = value
+        self._render_timer.start(30)
+        self._history_timer.start(500)
+
+    def _on_curve_changed(self, channel: str, points: list):
+        # Reassign a new "curves" dict rather than mutating the existing one
+        # in place -- _commit_history() only shallow-copies self.recipe, so
+        # an in-place edit here would silently rewrite already-pushed history
+        # entries too (they'd still be holding a reference to this same
+        # nested dict), making undo/redo a no-op for curve changes.
+        curves = dict(self.recipe.get("curves") or processing.default_curves())
+        curves[channel] = points
+        self.recipe["curves"] = curves
         self._render_timer.start(30)
         self._history_timer.start(500)
 
@@ -2221,6 +2241,7 @@ class EditorView(QWidget):
     def _sync_sliders_from_recipe(self):
         for key, widget in self.sliders.items():
             widget.set_value(self.recipe.get(key, 0.0))
+        self.curve_editor.set_curves(self.recipe.get("curves") or processing.default_curves())
 
     def _commit_history(self):
         if self.photo_id is None:

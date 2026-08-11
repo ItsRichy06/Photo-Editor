@@ -37,12 +37,23 @@ def default_recipe() -> dict:
         "blue": 0.0,  # -100..100, per-channel gain
         "sharpen": 0.0,  # 0..100
         "denoise": 0.0,  # 0..100
+        # Tone/color curves: {"rgb"/"red"/"green"/"blue": [[x, y], ...]},
+        # control points in [0,1] (input, output), always sorted by x with
+        # the first/last point anchored at x=0/x=1. See apply_curves().
+        "curves": default_curves(),
         # AI-selection-driven local adjustments: list of {"mask": <base64 PNG>,
         # "adjustments": {...}}. Masks are captured relative to the fully
         # geometry-processed (rotate/straighten/flip/crop) frame, so they
         # rescale consistently between the live preview and full-res export.
         "local_adjustments": [],
     }
+
+
+def default_curves() -> dict:
+    """Identity curve (output == input) for each channel -- a straight line
+    from (0,0) to (1,1) is a no-op once turned into a lookup table."""
+    return {"rgb": [[0.0, 0.0], [1.0, 1.0]], "red": [[0.0, 0.0], [1.0, 1.0]],
+            "green": [[0.0, 0.0], [1.0, 1.0]], "blue": [[0.0, 0.0], [1.0, 1.0]]}
 
 
 def default_local_adjustments() -> dict:
@@ -246,6 +257,93 @@ def apply_denoise(img, amount):
     return denoised_u8.astype(np.float32) / 255.0
 
 
+def is_identity_curve(points) -> bool:
+    """True for a 2-point straight line from (0,0) to (1,1) -- i.e. a curve
+    that hasn't been touched yet, so callers can skip it entirely."""
+    return len(points) <= 2 and all(abs(x - y) < 1e-6 for x, y in points)
+
+
+def curve_lut(points, size: int = 256) -> np.ndarray:
+    """Sample a curve through `points` (each an (x, y) pair in [0,1], sorted
+    by x) into a `size`-entry lookup table, via monotone cubic (Fritsch-
+    Carlson) interpolation. Monotone rather than a plain natural cubic
+    spline so the curve never overshoots *between* control points -- an
+    overshoot on a tone curve would crush/blow out pixels the user never
+    asked to clip. Also used by the curve-editor widget to draw the line
+    it shows, so the drawn curve and the one actually applied always match.
+    """
+    pts = sorted((float(x), float(y)) for x, y in points)
+    xs = np.array([p[0] for p in pts], dtype=np.float64)
+    ys = np.array([p[1] for p in pts], dtype=np.float64)
+    for i in range(1, len(xs)):
+        if xs[i] <= xs[i - 1]:
+            xs[i] = xs[i - 1] + 1e-6  # duplicate/out-of-order x: nudge apart
+
+    sample_x = np.linspace(0.0, 1.0, size)
+    if len(xs) < 2:
+        return np.clip(sample_x, 0.0, 1.0).astype(np.float32)
+    if len(xs) == 2:
+        return np.interp(sample_x, xs, ys).astype(np.float32)
+
+    h = np.diff(xs)
+    delta = np.diff(ys) / h
+    n = len(xs)
+    m = np.zeros(n)
+    m[0], m[-1] = delta[0], delta[-1]
+    for i in range(1, n - 1):
+        m[i] = 0.0 if delta[i - 1] * delta[i] <= 0 else (delta[i - 1] + delta[i]) / 2.0
+    for i in range(n - 1):
+        if delta[i] == 0:
+            m[i] = m[i + 1] = 0.0
+        else:
+            a, b = m[i] / delta[i], m[i + 1] / delta[i]
+            s = a * a + b * b
+            if s > 9.0:
+                t = 3.0 / math.sqrt(s)
+                m[i], m[i + 1] = t * a * delta[i], t * b * delta[i]
+
+    seg = np.clip(np.searchsorted(xs, sample_x, side="right") - 1, 0, n - 2)
+    x0, x1, y0, y1 = xs[seg], xs[seg + 1], ys[seg], ys[seg + 1]
+    m0, m1 = m[seg], m[seg + 1]
+    hseg = x1 - x0
+    t = np.clip((sample_x - x0) / hseg, 0.0, 1.0)
+    t2, t3 = t * t, t * t * t
+    h00, h10 = 2 * t3 - 3 * t2 + 1, t3 - 2 * t2 + t
+    h01, h11 = -2 * t3 + 3 * t2, t3 - t2
+    lut = h00 * y0 + h10 * hseg * m0 + h01 * y1 + h11 * hseg * m1
+    return lut.astype(np.float32)
+
+
+def _apply_lut(values: np.ndarray, lut: np.ndarray) -> np.ndarray:
+    xs = np.linspace(0.0, 1.0, len(lut))
+    return np.interp(values.ravel(), xs, lut).reshape(values.shape).astype(np.float32)
+
+
+def apply_curves(img: np.ndarray, curves: dict) -> np.ndarray:
+    """curves: {"rgb"/"red"/"green"/"blue": [[x, y], ...]}. The "rgb" master
+    curve applies first and identically to all three channels (classic
+    S-curve contrast, lifted black point, ...); any per-channel curve then
+    layers on top for color grading (e.g. lifting blue in the shadows)."""
+    if not curves:
+        return img
+    out = img
+    master = curves.get("rgb")
+    if master and not is_identity_curve(master):
+        out = _apply_lut(out, curve_lut(master))
+
+    active = [
+        (idx, curves[name])
+        for name, idx in (("red", 0), ("green", 1), ("blue", 2))
+        if curves.get(name) and not is_identity_curve(curves[name])
+    ]
+    if active:
+        if out is img:
+            out = out.copy()
+        for idx, points in active:
+            out[..., idx] = _apply_lut(out[..., idx], curve_lut(points))
+    return out
+
+
 def apply_local_layer(img: np.ndarray, mask: np.ndarray, adjustments: dict) -> np.ndarray:
     """Apply a scoped set of adjustments only within mask (0..1 per-pixel
     blend weight), leaving everything outside it untouched."""
@@ -306,6 +404,7 @@ def apply_recipe(img: np.ndarray, recipe: dict) -> np.ndarray:
     )
     out = apply_white_balance(out, recipe.get("temp", 0.0), recipe.get("tint", 0.0))
     out = apply_channel_gains(out, recipe.get("red", 0.0), recipe.get("green", 0.0), recipe.get("blue", 0.0))
+    out = apply_curves(out, recipe.get("curves"))
     out = apply_saturation_vibrance(out, recipe.get("saturation", 0.0), recipe.get("vibrance", 0.0))
     out = apply_sharpen(out, recipe.get("sharpen", 0.0))
     out = apply_denoise(out, recipe.get("denoise", 0.0))
