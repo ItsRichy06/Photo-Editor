@@ -29,10 +29,13 @@ from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QListView,
+    QMessageBox,
+    QProgressDialog,
     QPushButton,
     QStyle,
     QStyledItemDelegate,
@@ -42,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from .. import image_io, thumbnails
 from ..settings import LAST_LIBRARY_FOLDER, get_settings
-from . import widgets
+from . import stacking_dialogs, widgets
 
 THUMB_SIZE = 320
 CELL_W = 190
@@ -329,11 +332,16 @@ class LibraryView(QWidget):
         self.catalog = catalog
         self.settings = get_settings()
         self.loader_thread = None
+        self.current_folder = None
         # Old ThumbnailLoaderThreads being wound down after a folder switch
         # (see _retire_loader_thread) -- kept referenced here so Python
         # doesn't garbage-collect the wrapper object while the underlying
         # QThread is still actually running.
         self._retiring_threads = []
+        self._stack_progress = None
+        self._stack_analysis_thread = None
+        self._stack_process_thread = None
+        self._stack_results = []
 
         self.model = PhotoListModel(self)
         self.proxy = PhotoFilterProxy(self)
@@ -345,6 +353,14 @@ class LibraryView(QWidget):
         self.open_btn = QPushButton("Open Folder…")
         self.open_btn.clicked.connect(self.choose_folder)
         toolbar.addWidget(self.open_btn)
+
+        self.stack_btn = QPushButton("Stack Photos…")
+        self.stack_btn.setToolTip(
+            "Select 2+ photos (Ctrl/Shift-click), then auto-detect and merge HDR exposure "
+            "brackets and focus stacks among them."
+        )
+        self.stack_btn.clicked.connect(self._on_stack_photos)
+        toolbar.addWidget(self.stack_btn)
 
         toolbar.addWidget(QLabel("Show:"))
         self.type_filter = QComboBox()
@@ -369,7 +385,10 @@ class LibraryView(QWidget):
         toolbar.addStretch(1)
         main_layout.addLayout(toolbar)
 
-        hint = QLabel("Select a photo, then 1-5 = rate, P = pick, X = reject, U = clear flag, double-click = edit")
+        hint = QLabel(
+            "Select a photo, then 1-5 = rate, P = pick, X = reject, U = clear flag, double-click = edit. "
+            "Ctrl/Shift-click to select multiple, then Stack Photos to auto-merge HDR/focus brackets."
+        )
         hint.setStyleSheet("color: #888888; font-size: 11px;")
         main_layout.addWidget(hint)
 
@@ -380,7 +399,7 @@ class LibraryView(QWidget):
         self.list_view.setMovement(QListView.Movement.Static)
         self.list_view.setUniformItemSizes(True)
         self.list_view.setSpacing(6)
-        self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.delegate = PhotoDelegate(self.list_view)
         self.delegate.ratingEdited.connect(self._on_rating_edited)
         self.list_view.setItemDelegate(self.delegate)
@@ -468,6 +487,7 @@ class LibraryView(QWidget):
             self._retire_loader_thread(self.loader_thread)
 
         self.model.clear()
+        self.current_folder = folder
         self.settings.setValue(LAST_LIBRARY_FOLDER, folder)
         self.status_label.setText("Scanning…")
 
@@ -487,6 +507,94 @@ class LibraryView(QWidget):
 
     def _on_scan_finished(self, count: int):
         self.status_label.setText(f"{count} photos")
+
+    # ---------------------------------------------------------- stacking
+
+    def _selected_paths(self) -> list:
+        indexes = self.list_view.selectionModel().selectedIndexes()
+        return [Path(idx.data(PhotoListModel.PathRole)) for idx in indexes]
+
+    def _on_stack_photos(self):
+        paths = self._selected_paths()
+        if len(paths) < 2:
+            QMessageBox.information(self, "Stack Photos", "Select at least 2 photos to stack (Ctrl/Shift-click).")
+            return
+
+        self._stack_progress = QProgressDialog("Analyzing selected photos…", "Cancel", 0, len(paths), self)
+        self._stack_progress.setWindowTitle("Stack Photos")
+        self._stack_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._stack_progress.setMinimumDuration(0)
+        self._stack_progress.setValue(0)
+
+        self._stack_analysis_thread = stacking_dialogs.StackAnalysisThread(paths, self)
+        self._stack_analysis_thread.progress.connect(self._on_stack_analysis_progress)
+        self._stack_analysis_thread.finished_analysis.connect(self._on_stack_analysis_finished)
+        self._stack_progress.canceled.connect(self._stack_analysis_thread.stop)
+        self._stack_analysis_thread.start()
+
+    def _on_stack_analysis_progress(self, done: int, total: int):
+        if self._stack_progress is not None:
+            self._stack_progress.setValue(done)
+
+    def _on_stack_analysis_finished(self, candidates: list, leftover: list):
+        if self._stack_progress is not None:
+            self._stack_progress.close()
+            self._stack_progress = None
+        if not candidates:
+            QMessageBox.information(
+                self, "Stack Photos", "No HDR exposure brackets or focus stacks were detected in the selected photos."
+            )
+            return
+        dialog = stacking_dialogs.StackPreviewDialog(candidates, leftover, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = dialog.selected_candidates()
+        if chosen:
+            self._run_stack_processing(chosen)
+
+    def _run_stack_processing(self, candidates: list):
+        self._stack_results = []
+        self._stack_progress = QProgressDialog("Processing…", "Cancel", 0, len(candidates), self)
+        self._stack_progress.setWindowTitle("Stack Photos")
+        self._stack_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._stack_progress.setMinimumDuration(0)
+        self._stack_progress.setValue(0)
+
+        self._stack_process_thread = stacking_dialogs.StackProcessingThread(candidates, self.catalog, self)
+        self._stack_process_thread.progress.connect(self._on_stack_process_progress)
+        self._stack_process_thread.group_done.connect(self._on_stack_group_done)
+        self._stack_process_thread.finished_processing.connect(self._on_stack_process_finished)
+        self._stack_progress.canceled.connect(self._stack_process_thread.stop)
+        self._stack_process_thread.start()
+
+    def _on_stack_process_progress(self, done: int, total: int, label: str):
+        if self._stack_progress is None:
+            return
+        if done < total:
+            self._stack_progress.setLabelText(f"Processing {done + 1}/{total}: {label}")
+        else:
+            self._stack_progress.setLabelText("Finishing…")
+        self._stack_progress.setValue(done)
+
+    def _on_stack_group_done(self, candidate, out_path, error):
+        self._stack_results.append((candidate, out_path, error))
+
+    def _on_stack_process_finished(self):
+        if self._stack_progress is not None:
+            self._stack_progress.close()
+            self._stack_progress = None
+
+        succeeded = [r for r in self._stack_results if r[1] is not None]
+        failed = [r for r in self._stack_results if r[1] is None]
+        message = f"Created {len(succeeded)} new photo{'s' if len(succeeded) != 1 else ''}."
+        if failed:
+            message += f"\n\n{len(failed)} group{'s' if len(failed) != 1 else ''} failed:\n" + "\n".join(
+                f"  {c.label}: {err}" for c, _, err in failed[:8]
+            )
+        QMessageBox.information(self, "Stack Photos", message)
+
+        if succeeded and self.current_folder:
+            self.load_folder(self.current_folder)  # picks up the new files, non-blocking (see _retire_loader_thread)
 
     def _on_double_clicked(self, index):
         if not index.isValid():
