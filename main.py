@@ -44,7 +44,10 @@ def main():
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
     window = MainWindow()
-    window.show()
+    # Maximized (not showFullScreen()) -- fills the screen but keeps the
+    # title bar and window controls, unlike true fullscreen which would
+    # need its own escape-hatch shortcut the app doesn't have.
+    window.showMaximized()
     sys.exit(app.exec())
 
 
