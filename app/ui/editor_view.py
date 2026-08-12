@@ -1717,6 +1717,13 @@ class EditorView(QWidget):
         self._render_timer.start(30)
         self._history_timer.start(500)
 
+    def _update_histogram_displays(self, arr):
+        """Feeds the same rendered array to both the standalone histogram
+        panel and the curve editor's per-channel background histogram, so
+        they never show data from two different renders."""
+        self.histogram.set_image(arr)
+        self.curve_editor.set_histograms(widgets.compute_log_histograms(arr))
+
     def _render_preview(self):
         if self.preview_source is None:
             return
@@ -1724,7 +1731,7 @@ class EditorView(QWidget):
             # Trivial fast path -- no processing needed, no reason to bounce
             # through the background thread for this.
             self.canvas.set_pixmap(widgets.numpy_to_qpixmap(self.preview_source))
-            self.histogram.set_image(self.preview_source)
+            self._update_histogram_displays(self.preview_source)
             return
 
         recipe_for_render = self.recipe
@@ -1744,7 +1751,7 @@ class EditorView(QWidget):
             mask_for_overlay = self.pending_mask if self.pending_mask.dtype == bool else self.pending_mask > 0.3
             self.canvas.set_mask_overlay(mask_for_overlay)
         self.canvas.set_pixmap(widgets.numpy_to_qpixmap(out))
-        self.histogram.set_image(out)
+        self._update_histogram_displays(out)
 
     def _on_compare_toggle(self, checked: bool):
         self._show_original = checked

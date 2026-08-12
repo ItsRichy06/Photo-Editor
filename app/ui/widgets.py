@@ -199,6 +199,25 @@ class LabeledSlider(QWidget):
         self._updating = False
 
 
+def compute_log_histograms(arr: np.ndarray) -> dict:
+    """Per-channel + luminance histogram counts (256 bins, log-scaled so a
+    tall spike like a solid sky doesn't flatten the rest), keyed to match
+    CURVE_CHANNELS' "rgb"/"red"/"green"/"blue". NOT normalized to a peak --
+    shared raw data for HistogramWidget and CurveEditor, which each want a
+    different normalization (see their own set_image()/set_histograms())."""
+    img8 = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+    r = np.bincount(img8[..., 0].ravel(), minlength=256).astype(np.float32)
+    g = np.bincount(img8[..., 1].ravel(), minlength=256).astype(np.float32)
+    b = np.bincount(img8[..., 2].ravel(), minlength=256).astype(np.float32)
+    luminance = (
+        0.299 * img8[..., 0].astype(np.float32)
+        + 0.587 * img8[..., 1].astype(np.float32)
+        + 0.114 * img8[..., 2].astype(np.float32)
+    ).astype(np.uint8)
+    lum = np.bincount(luminance.ravel(), minlength=256).astype(np.float32)
+    return {"rgb": np.log1p(lum), "red": np.log1p(r), "green": np.log1p(g), "blue": np.log1p(b)}
+
+
 class HistogramWidget(QWidget):
     """Live histogram of the currently rendered preview image, drawn as two
     separate charts (each normalized to its own peak) rather than one
@@ -217,18 +236,8 @@ class HistogramWidget(QWidget):
         self._luminance = None  # length-256 float array normalized 0..1
 
     def set_image(self, arr: np.ndarray):
-        img8 = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
-        r = np.bincount(img8[..., 0].ravel(), minlength=256).astype(np.float32)
-        g = np.bincount(img8[..., 1].ravel(), minlength=256).astype(np.float32)
-        b = np.bincount(img8[..., 2].ravel(), minlength=256).astype(np.float32)
-        luminance = (
-            0.299 * img8[..., 0].astype(np.float32)
-            + 0.587 * img8[..., 1].astype(np.float32)
-            + 0.114 * img8[..., 2].astype(np.float32)
-        ).astype(np.uint8)
-        lum_counts = np.bincount(luminance.ravel(), minlength=256).astype(np.float32)
-        # log-scale so a tall spike (e.g. a solid sky) doesn't flatten the rest
-        r, g, b, lum_counts = np.log1p(r), np.log1p(g), np.log1p(b), np.log1p(lum_counts)
+        hist = compute_log_histograms(arr)
+        r, g, b, lum_counts = hist["red"], hist["green"], hist["blue"], hist["rgb"]
         # Each chart normalizes against its own peak -- otherwise a much
         # taller luminance peak would flatten the RGB curves or vice versa.
         rgb_peak = max(r.max(), g.max(), b.max(), 1e-6)
@@ -340,6 +349,7 @@ class _CurveCanvas(QWidget):
         self._drag_index = None
         self._hover_index = None
         self._pad = 8.0
+        self._histograms = None  # {"rgb"/"red"/"green"/"blue": raw log-scaled counts}, see set_histograms()
 
     # -- geometry: 0..1 curve space <-> widget pixels, y flipped (up = brighter)
     def _plot_rect(self) -> QRect:
@@ -367,6 +377,17 @@ class _CurveCanvas(QWidget):
 
     def curves(self) -> dict:
         return {k: [list(p) for p in v] for k, v in self._curves.items()}
+
+    def set_histograms(self, histograms: dict | None):
+        """histograms: compute_log_histograms()'s output, or None to clear
+        (e.g. no photo open). Each channel's curve is drawn against *that
+        channel's own* histogram -- so switching to Red shows where red is
+        actually clipping/bunched, not the overall exposure -- normalized
+        to its own peak (unlike HistogramWidget's shared-peak R/G/B
+        chart), since only one channel's histogram is ever shown here at a
+        time and should fill the plot regardless of which channel it is."""
+        self._histograms = histograms
+        self.update()
 
     def active_channel(self) -> str:
         return self._active
@@ -396,6 +417,12 @@ class _CurveCanvas(QWidget):
         painter.setPen(QColor("#262626"))
         painter.setBrush(QColor("#101010"))
         painter.drawRect(r)
+
+        if self._histograms is not None:
+            channel_colors = {key: color for key, _, color in CURVE_CHANNELS}
+            counts = self._histograms.get(self._active)
+            if counts is not None and counts.max() > 0:
+                self._draw_histogram_bg(painter, r, counts / counts.max(), channel_colors[self._active])
 
         painter.setPen(QPen(QColor("#242424"), 1))
         for i in (1, 2):
@@ -431,6 +458,23 @@ class _CurveCanvas(QWidget):
                     painter.setBrush(QColor("#ffffff") if hovered else base_color)
                     rad = 5.5 if hovered else 4.0
                     painter.drawEllipse(pos, rad, rad)
+
+    @staticmethod
+    def _draw_histogram_bg(painter, rect: QRect, values: np.ndarray, color: QColor):
+        """Filled area chart of `values` (0..1, already normalized) behind
+        the curve -- same drawing approach as HistogramWidget's own charts,
+        just dim enough to stay a backdrop rather than compete with the
+        curve line and control points drawn on top of it."""
+        dim = QColor(color)
+        dim.setAlpha(70)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(dim)
+        n = len(values)
+        x0, y0, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+        points = [QPointF(x0 + i / (n - 1) * w, y0 + h - float(v) * h) for i, v in enumerate(values)]
+        points.append(QPointF(x0 + w, y0 + h))
+        points.append(QPointF(x0, y0 + h))
+        painter.drawPolygon(QPolygonF(points))
 
     # -- mouse interaction
     def _hit_test(self, pos):
@@ -579,3 +623,6 @@ class CurveEditor(QWidget):
 
     def curves(self) -> dict:
         return self._canvas.curves()
+
+    def set_histograms(self, histograms: dict | None):
+        self._canvas.set_histograms(histograms)
