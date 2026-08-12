@@ -208,10 +208,11 @@ class HistogramWidget(QWidget):
 
     LABEL_H = 14
     GAP = 6
+    CAPTION_H = 46
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(160)
+        self.setMinimumHeight(160 + self.CAPTION_H)
         self._channels = None  # (r, g, b) each a length-256 float array normalized 0..1
         self._luminance = None  # length-256 float array normalized 0..1
 
@@ -238,20 +239,33 @@ class HistogramWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#181818"))
+
+        w = self.width()
+        font = painter.font()
+        font.setPointSize(8)
+        painter.setFont(font)
+
+        # Always drawn, even before a photo is open -- otherwise this whole
+        # widget is just empty black with no indication of what it's for.
+        caption_rect = QRect(2, self.height() - self.CAPTION_H, w - 4, self.CAPTION_H)
+        painter.setPen(QColor("#777777"))
+        painter.drawText(
+            caption_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+            "Left = dark, right = bright. A channel piled up at the right is near or fully "
+            "blown out (clipped).",
+        )
+
         if self._channels is None:
             return
 
-        w = self.width()
-        chart_h = max(10, (self.height() - 2 * self.LABEL_H - self.GAP) // 2)
+        chart_h = max(10, (self.height() - 2 * self.LABEL_H - self.GAP - self.CAPTION_H) // 2)
 
         top_label = QRect(2, 0, w - 4, self.LABEL_H)
         top_chart = QRect(0, self.LABEL_H, w, chart_h)
         bottom_label = QRect(2, self.LABEL_H + chart_h + self.GAP, w - 4, self.LABEL_H)
         bottom_chart = QRect(0, 2 * self.LABEL_H + chart_h + self.GAP, w, chart_h)
 
-        font = painter.font()
-        font.setPointSize(8)
-        painter.setFont(font)
         painter.setPen(QColor("#999999"))
         painter.drawText(top_label, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "Exposure")
         painter.drawText(bottom_label, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "Red / Green / Blue")
