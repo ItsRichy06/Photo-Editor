@@ -41,9 +41,28 @@ git commits.
   release steps. Every release from here needs a `CHANGELOG.md` entry and
   a version bump in that file; `publish.ps1` checks both before it'll
   publish anything.
+- `tests/test_updater.py`: this project's first actual test file, covering
+  the update-check module's happy path and every failure mode it's
+  designed to survive (see below for where that list came from).
 ### Changed
 - The update check is a no-op unless it detects it's running from the
   actual installed copy, so it never fires while developing from `.venv`.
+### Fixed (found while first setting this up, not after shipping)
+- The NAS distribution share turned out to not be exclusively this app's --
+  confirmed live, an unrelated app (Video Editor) is also publishing into
+  the same directory, and its own update-feed manifest was already sitting
+  there under the same generic filename ("latest.json") this app's first
+  draft also used. A hash check alone doesn't protect against reading the
+  wrong app's (individually valid, correctly-hashed) feed -- it only
+  proves a download matches what its manifest says, not that the manifest
+  is actually this app's. Fixed with a namespaced manifest filename
+  (`photoeditor-latest.json`) plus a content sanity check that refuses to
+  trust a manifest whose named installer doesn't look like this app's.
+- The distribution share also turned out to sometimes refuse to overwrite
+  a file it had happily created moments earlier, in the same session --
+  the same ownership quirk this project has hit repeatedly on this share.
+  `publish.ps1` now falls back to a timestamped filename when the plain
+  one is blocked, rather than failing the whole publish.
 
 ## [1.8.0] - 2026-08-28
 ### Changed

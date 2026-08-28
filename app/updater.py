@@ -46,7 +46,19 @@ log = logging.getLogger(__name__)
 # per-machine/per-session thing, not guaranteed to exist (or use the same
 # letter) on every machine this app runs on.
 UPDATE_FEED_DIR = Path(r"\\NAS\FamilyStorage\shares\Personal\fotoeditor")
-MANIFEST_NAME = "latest.json"
+# Namespaced, not the generic "latest.json" it started as: this folder
+# turned out to NOT be exclusively this app's -- confirmed live, a
+# completely unrelated app (Richard's separate Video Editor project) is
+# also publishing into it, and its own manifest was sitting right here
+# under that exact generic name. A hash check alone doesn't save you from
+# this: it only proves "the downloaded file matches what the manifest
+# said", not "this manifest is actually for this app" -- if this app ever
+# read the other one's feed, a version number that happened to compare as
+# "newer" would make it hash-verify and offer to install a stranger's
+# installer as if it were its own update. Namespacing the filename is what
+# actually prevents that, not coordinating with whatever else happens to
+# be writing here.
+MANIFEST_NAME = "photoeditor-latest.json"
 
 
 def _is_packaged_install() -> bool:
@@ -92,6 +104,22 @@ class _UpdateCheckWorker(QObject):
         installer_name = manifest["installer"]
         expected_sha256 = manifest["sha256"].lower()
         notes = manifest.get("notes", "")
+
+        # Belt and suspenders on top of the namespaced manifest filename
+        # above: confirmed live that this feed directory isn't exclusively
+        # this app's, so if a manifest ever somehow ends up here under this
+        # name that isn't actually this app's (a future third app reusing
+        # the name, a copy-paste mistake, anything), this is what stops it
+        # from being trusted rather than a hash check that would happily
+        # "verify" a stranger's installer against its own (correct, but
+        # irrelevant) hash.
+        if "photoeditor" not in installer_name.lower():
+            log.error(
+                "update check: manifest %s names installer %r, which doesn't look like this "
+                "app's -- refusing to trust it (this feed directory is shared with other apps)",
+                manifest_path, installer_name,
+            )
+            return
 
         if _parse_version(remote_version) <= _parse_version(__version__):
             log.info("update check: already on %s (feed has %s)", __version__, remote_version)

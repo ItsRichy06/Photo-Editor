@@ -125,7 +125,18 @@ forward rather than rediscovering:
   it fails completely silently by design (only a log line, no dialog) on
   anything from the share being unreachable to a manifest/file mismatch --
   check the log before assuming it's broken versus just not able to reach
-  `\\NAS\FamilyStorage` from wherever the app is currently running.
+  `\\NAS\FamilyStorage` from wherever the app is currently running. Two
+  things found live while first setting this up, both fixed before this
+  ever shipped: (1) the feed directory turned out to NOT be exclusive to
+  this app -- a separate app (Video Editor) publishes into the exact same
+  directory, and had already claimed the generic manifest filename
+  ("latest.json") this app's first draft also picked -- hence the
+  `photoeditor-` prefix, plus a content check refusing to trust a manifest
+  that doesn't look like this app's even if the filename ever collides
+  again some other way; (2) the share can refuse to overwrite a file it
+  happily created moments earlier in the same session (the same ownership
+  quirk documented elsewhere in this file) -- `publish.ps1` falls back to
+  a timestamped filename rather than failing the whole publish over it.
 - **2026-08-28: rebranded "Foto Editor" -> "Photo Editor"** (source, window
   title, installer, docs -- everything except the actual project folder
   path, which is still `Foto Editor` on disk on both the desktop and this
