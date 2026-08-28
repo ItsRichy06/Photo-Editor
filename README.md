@@ -44,6 +44,12 @@ still works, just slower (CPU fallback). Installs to
 and optional desktop shortcuts using the app icon, and a normal uninstaller.
 It's ~2.7GB; that's expected, the bulk is PyTorch + CUDA.
 
+An installed copy checks once per launch for a newer version on the home
+NAS and, if one's there and hash-verified, asks before installing it --
+never without confirming, and it's silently a no-op if the NAS isn't
+reachable. See `HANDOFF.md`'s "Releasing a new version" section for how a
+new release gets published.
+
 To rebuild the runtime + installer after changing code:
 ```bash
 # one-time: download the embeddable Python and set it up (see runtime_build/runtime)
@@ -180,4 +186,5 @@ adjustments, or deleted; add as many as you like.
 ## Status
 
 All three planned phases are built: library + ratings, the full editing
-toolkit, and AI-powered object selection plus manual brush masking.
+toolkit, and AI-powered object selection plus manual brush masking. See
+`CHANGELOG.md` for the version history.

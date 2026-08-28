@@ -13,6 +13,8 @@ from PySide6.QtWidgets import QApplication
 
 from app.ui.main_window import MainWindow
 from app.ui.theme import apply_dark_theme
+from app.updater import check_for_updates
+from app.version import __version__
 
 APP_ID = "PhotoEditor.PhotoEditor.1"
 ICON_PATH = Path(__file__).parent / "assets" / "app_icon.ico"
@@ -36,6 +38,7 @@ def main():
     _set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("Photo Editor")
+    app.setApplicationVersion(__version__)
     # Explicit, OS-theme-independent styling -- without this the app just
     # inherited whatever light/dark mode Windows itself was set to, which is
     # why it looked completely different (plain white, unstyled controls) on
@@ -45,6 +48,9 @@ def main():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
     window = MainWindow()
     window.show()
+    # Best-effort, non-blocking, and a no-op unless this is an actual
+    # installed copy -- see app/updater.py.
+    check_for_updates(window)
     sys.exit(app.exec())
 
 

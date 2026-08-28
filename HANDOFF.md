@@ -119,7 +119,14 @@ Roughly newest-first. Each of these was a real bug that shipped and got
 fixed within this same project -- the pattern/lesson is worth carrying
 forward rather than rediscovering:
 
-- **2026-08-09: rebranded "Foto Editor" -> "Photo Editor"** (source, window
+- **2026-08-28: auto-update added** (`app/updater.py`, `installer/publish.ps1`,
+  `app/version.py`, `CHANGELOG.md`) -- see "Releasing a new version" above
+  for the mechanics. Worth knowing if it ever seems to have stopped working:
+  it fails completely silently by design (only a log line, no dialog) on
+  anything from the share being unreachable to a manifest/file mismatch --
+  check the log before assuming it's broken versus just not able to reach
+  `\\NAS\FamilyStorage` from wherever the app is currently running.
+- **2026-08-28: rebranded "Foto Editor" -> "Photo Editor"** (source, window
   title, installer, docs -- everything except the actual project folder
   path, which is still `Foto Editor` on disk on both the desktop and this
   laptop copy; renaming a folder a live session is running out of is asking
@@ -194,6 +201,32 @@ reinstall rather than just running the new installer over the old one --
 confirmed Inno Setup doesn't clean up files that a newer build no longer
 references, so an in-place "upgrade" can leave stale/removed dependencies
 sitting around at full size.
+
+## Releasing a new version (`CHANGELOG.md` + auto-update)
+
+Every release needs, in order:
+
+1. Bump `__version__` in `app/version.py`.
+2. Add a matching top entry to `CHANGELOG.md` (see existing entries for the
+   format -- `0.x` was pre-functioning-product development, `1.0.0` is the
+   first version with all three original phases done, a new tool/capability
+   bumps the minor version, a fix/tweak/polish pass bumps the patch version).
+3. Rebuild the installer (above).
+4. `powershell -ExecutionPolicy Bypass -File installer\publish.ps1 -Version X.Y.Z`
+   -- copies the installer to the distribution share and publishes the
+   auto-update feed manifest (`latest.json`) alongside it. Refuses to run at
+   all if step 1 or 2 was skipped (checks both files actually mention the
+   version being published), and refuses to publish the manifest if the
+   copied installer's hash doesn't match what it's about to advertise --
+   see the script's own header for why that specific check exists.
+
+Already-installed copies check that share once per launch (`app/updater.py`)
+and, if a newer verified version is there, ask before installing it -- never
+without a click, never mid-session, only once fully downloaded and hash-
+checked. Only runs against an actual installed copy, never `.venv`. If the
+share isn't reachable (e.g. away from home without VPN/Tailscale to the NAS),
+the check just silently does nothing -- same as if this feature didn't
+exist, by design, not a bug to fix.
 
 ## What's not copied here, and why
 

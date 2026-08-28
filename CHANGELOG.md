@@ -18,6 +18,33 @@ git commits.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-08-28
+### Added
+- Auto-update: on launch, the installed app checks the NAS distribution
+  share for a newer version and, if one's there, downloads and hash-
+  verifies it in the background before ever mentioning it, then asks
+  ("Update Now" / "Later") -- never installs without a click. Modeled on
+  the update mechanism in Richard's other desktop app (Electron +
+  electron-updater against a version-manifest feed); same shape, hand-
+  rolled for this app's Python/Inno Setup stack. Carries over that app's
+  central lesson the hard way already learned once there rather than
+  relearning it here: a manifest that names a file which doesn't actually
+  match what's published fails completely silently (no dialog, no visible
+  error, just a swallowed exception no one happens to be watching for) --
+  so `installer/publish.ps1` re-hashes the file it just copied and
+  refuses to publish the manifest unless it actually matches, and the app
+  itself only ever installs a download whose hash matches what the
+  manifest promised.
+- `app/version.py` as the single source of truth for the app's version
+  (this is the first version tracked this way), and `installer/publish.ps1`
+  to publish a build to the distribution share -- see its header for the
+  release steps. Every release from here needs a `CHANGELOG.md` entry and
+  a version bump in that file; `publish.ps1` checks both before it'll
+  publish anything.
+### Changed
+- The update check is a no-op unless it detects it's running from the
+  actual installed copy, so it never fires while developing from `.venv`.
+
 ## [1.8.0] - 2026-08-28
 ### Changed
 - Rebranded "Foto Editor" to "Photo Editor" throughout: window title,
