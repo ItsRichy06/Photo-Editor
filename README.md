@@ -1,4 +1,4 @@
-# Foto Editor
+# Photo Editor
 
 A local photo library + non-destructive editor for JPG/JPEG and Sony ARW (RAW) files.
 Everything runs on-device; nothing is uploaded anywhere.
@@ -31,8 +31,8 @@ or
 .venv\Scripts\python.exe main.py
 ```
 
-Or install it properly: run `installer_output\FotoEditor-Setup.exe` (built from
-`installer\FotoEditor.iss` via Inno Setup). It's a **universal installer** --
+Or install it properly: run `installer_output\PhotoEditor-Setup.exe` (built from
+`installer\PhotoEditor.iss` via Inno Setup). It's a **universal installer** --
 self-contained, works on any Windows 10/11 x64 PC, does not require Python (or
 any particular version of it) to be installed first. It bundles the official
 Python embeddable distribution with every dependency (PySide6, rawpy, OpenCV,
@@ -40,7 +40,7 @@ CUDA-enabled PyTorch, ultralytics/SAM2) installed directly into it, plus the
 Visual C++ Redistributable, so nothing needs to be downloaded during install.
 An NVIDIA GPU accelerates AI Select when present; without one, everything
 still works, just slower (CPU fallback). Installs to
-`%LOCALAPPDATA%\Programs\FotoEditor` (no admin rights needed), with Start Menu
+`%LOCALAPPDATA%\Programs\PhotoEditor` (no admin rights needed), with Start Menu
 and optional desktop shortcuts using the app icon, and a normal uninstaller.
 It's ~2.7GB; that's expected, the bulk is PyTorch + CUDA.
 
@@ -62,7 +62,7 @@ runtime_build\runtime\python.exe -m pip uninstall -y polars polars-runtime-32
 runtime_build\runtime\python.exe -m pip install --force-reinstall --no-deps PySide6-Essentials shiboken6
 
 # then, any time:
-"C:\Users\Richard\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer\FotoEditor.iss
+"C:\Users\Richard\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer\PhotoEditor.iss
 ```
 (`runtime_build/` holds the self-contained Python the installer bundles --
 separate from `.venv`, which is only for local development.)
@@ -79,7 +79,7 @@ Use the "Show" dropdown to filter to JPEG-only, RAW-only, or all; "Min rating" a
 - Double-click opens it in the editor
 
 Ratings, flags, and edits are stored in a local catalog database at
-`%LOCALAPPDATA%\FotoEditor\catalog.db` — your original photo files are never
+`%LOCALAPPDATA%\PhotoEditor\catalog.db` — your original photo files are never
 modified.
 
 **Editor**: the "Photo Info" panel on the left shows the shooting data read

@@ -1,4 +1,4 @@
-; Foto Editor installer script (Inno Setup).
+; Photo Editor installer script (Inno Setup).
 ;
 ; Bundles a self-contained Python runtime (the official embeddable
 ; distribution, not a venv referencing this machine's installed Python) with
@@ -11,21 +11,25 @@
 ; extensions (numpy/torch/opencv/PySide6) need it and a clean Windows
 ; install won't have it.
 
-#define MyAppName "Foto Editor"
+#define MyAppName "Photo Editor"
 #define MyAppVersion "1.0"
-#define MyAppPublisher "Foto Editor"
+#define MyAppPublisher "Photo Editor"
 
 [Setup]
-AppId={{B7B9B9B4-6E3B-4C5A-9B0E-1E9F6C2D7A11}
+; A fresh AppId (was B7B9B9B4-...-1E9F6C2D7A11 under the old "Foto Editor"
+; name) -- this is now a genuinely distinct product identity, not an
+; in-place upgrade, so it gets its own GUID rather than reusing the old
+; one and confusing Inno Setup's upgrade-detection logic.
+AppId={{3E79FC5F-81EF-4F55-945F-229A4685B1FD}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\FotoEditor
-DefaultGroupName=Foto Editor
+DefaultDirName={localappdata}\Programs\PhotoEditor
+DefaultGroupName=Photo Editor
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\installer_output
-OutputBaseFilename=FotoEditor-Setup
+OutputBaseFilename=PhotoEditor-Setup
 SetupIconFile=..\assets\app_icon.ico
 UninstallDisplayIcon={app}\assets\app_icon.ico
 Compression=lzma2/fast
@@ -50,10 +54,10 @@ Source: "..\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubd
 Source: "..\runtime_build\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "__pycache__,*.pyc"
 
 [Icons]
-Name: "{group}\Foto Editor"; Filename: "{app}\runtime\pythonw.exe"; Parameters: """{app}\main.py"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\app_icon.ico"
-Name: "{group}\Uninstall Foto Editor"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Foto Editor"; Filename: "{app}\runtime\pythonw.exe"; Parameters: """{app}\main.py"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\app_icon.ico"; Tasks: desktopicon
+Name: "{group}\Photo Editor"; Filename: "{app}\runtime\pythonw.exe"; Parameters: """{app}\main.py"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\app_icon.ico"
+Name: "{group}\Uninstall Photo Editor"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\Photo Editor"; Filename: "{app}\runtime\pythonw.exe"; Parameters: """{app}\main.py"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\app_icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Visual C++ Redistributable..."; Flags: waituntilterminated
-Filename: "{app}\runtime\pythonw.exe"; Parameters: """{app}\main.py"""; WorkingDir: "{app}"; Description: "Launch Foto Editor now"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\runtime\pythonw.exe"; Parameters: """{app}\main.py"""; WorkingDir: "{app}"; Description: "Launch Photo Editor now"; Flags: nowait postinstall skipifsilent

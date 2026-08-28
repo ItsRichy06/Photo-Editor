@@ -15,7 +15,7 @@ ICON_PATH = Path(__file__).parent.parent.parent / "assets" / "app_icon.ico"
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Foto Editor")
+        self.setWindowTitle("Photo Editor")
         self.resize(1680, 1020)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))

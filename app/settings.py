@@ -7,4 +7,4 @@ LAST_EXPORT_FOLDER = "export/last_folder"
 
 
 def get_settings() -> QSettings:
-    return QSettings("FotoEditor", "FotoEditor")
+    return QSettings("PhotoEditor", "PhotoEditor")

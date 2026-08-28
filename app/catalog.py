@@ -14,7 +14,7 @@ DEFAULT_DB_NAME = "catalog.db"
 
 def app_data_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    d = Path(base) / "FotoEditor"
+    d = Path(base) / "PhotoEditor"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

@@ -1,6 +1,6 @@
 # Handoff notes
 
-Written 2026-08-09, before a 2-week trip, so work on Foto Editor can continue
+Written 2026-08-09, before a 2-week trip, so work on Photo Editor can continue
 from a laptop. This file covers project status, environment setup, the
 project's shape, and things that broke once already so they don't get
 relearned the hard way on a fresh machine. **README.md** is the user-facing
@@ -25,7 +25,7 @@ Two separate things you might want to do:
 
 **Just run the app** (no code changes): install `installer_output` isn't
 included in this copy (see "What's not copied" below) -- rebuild it, or
-grab the latest `FotoEditor-Setup-*.exe` from the distribution share if
+grab the latest `PhotoEditor-Setup-*.exe` from the distribution share if
 you have network access to it (`Z:\shares\Personal\fotoeditor\`, see
 "Where things live"). It's a universal installer, no Python required on
 the target machine.
@@ -63,7 +63,10 @@ that section alone:
 - **This copy**: `X:\Foto Editor` (laptop-portable copy, made 2026-08-09)
 - **Original**: `C:\Users\Richard\Documents\Foto Editor` (desktop)
 - **Catalog** (ratings/flags/edit recipes -- NOT in the project folder):
-  `%LOCALAPPDATA%\FotoEditor\catalog.db` on whichever machine you're using.
+  `%LOCALAPPDATA%\PhotoEditor\catalog.db` on whichever machine you're using
+  (was `%LOCALAPPDATA%\FotoEditor\catalog.db` before the 2026-08-09 Foto->Photo
+  rebrand -- the old data was migrated to the new path at that point, and the
+  old folder was left in place untouched as a backup, not deleted).
   This does not travel with the project copy -- the laptop starts with an
   empty catalog unless you copy that file over too. Since it stores absolute
   photo paths, it's only useful if the same photos are reachable at the same
@@ -116,6 +119,23 @@ Roughly newest-first. Each of these was a real bug that shipped and got
 fixed within this same project -- the pattern/lesson is worth carrying
 forward rather than rediscovering:
 
+- **2026-08-09: rebranded "Foto Editor" -> "Photo Editor"** (source, window
+  title, installer, docs -- everything except the actual project folder
+  path, which is still `Foto Editor` on disk on both the desktop and this
+  laptop copy; renaming a folder a live session is running out of is asking
+  for trouble, so that was deliberately left alone). Two things about this
+  that aren't obvious from a plain find-replace: the QSettings org/app name
+  changed (`FotoEditor` -> `PhotoEditor`, i.e. a different registry key,
+  `HKCU\Software\PhotoEditor\PhotoEditor` now), and the appdata folder name
+  changed too (`%LOCALAPPDATA%\FotoEditor` -> `...\PhotoEditor`, where
+  `catalog.db` and the thumbnail cache live). Both were migrated (copied,
+  not moved -- the old `FotoEditor` registry key and appdata folder are
+  still there as an untouched backup) as part of the rebrand; if a *third*
+  machine ever needs the same migration, check `git log` around this commit
+  for the exact commands used. The installer also got a new AppId GUID
+  (it's a distinct product identity now, not an in-place upgrade of the old
+  one) -- meaning the old "Foto Editor" install has to be uninstalled
+  separately, a new install won't find/replace it automatically.
 - **Qt stylesheets silently drop spinbox arrows.** The instant any QSS rule
   touches `QDoubleSpinBox`/`QSpinBox`, Qt stops drawing its own native
   up/down arrow glyphs for it -- and the classic CSS "zero-size box +
@@ -127,7 +147,8 @@ forward rather than rediscovering:
   If you add more custom-styled widgets with subcontrols (QComboBox dropdown
   arrows are the next likely victim), expect the same issue.
 - **A QSS rule change needs the installer's `[Files]` section to actually
-  bundle new asset files.** `installer/FotoEditor.iss` used to reference
+  bundle new asset files.** `installer/PhotoEditor.iss` (named `FotoEditor.iss`
+  at the time) used to reference
   `assets\app_icon.ico` by exact filename; adding the two arrow PNGs above
   required switching that to a wildcard (`assets\*`). If you add new asset
   types again, double check they're covered by a wildcard, not an exact
@@ -162,7 +183,7 @@ Needs `runtime_build/runtime` to exist (not copied here -- see README's
 "rebuild the runtime + installer" section for the one-time setup), then:
 
 ```bash
-"C:\Users\Richard\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer\FotoEditor.iss
+"C:\Users\Richard\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer\PhotoEditor.iss
 ```
 
 Inno Setup itself also isn't copied here -- reinstall it on whichever
