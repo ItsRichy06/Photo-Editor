@@ -8,4 +8,4 @@ mismatch between the update feed and what's actually served fails
 completely silently at the client end, so anything that can be checked at
 publish time should be)."""
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"

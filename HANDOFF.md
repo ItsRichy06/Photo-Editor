@@ -119,6 +119,33 @@ Roughly newest-first. Each of these was a real bug that shipped and got
 fixed within this same project -- the pattern/lesson is worth carrying
 forward rather than rediscovering:
 
+- **2026-08-29: reconciled two weeks of independent desktop/laptop work.**
+  This laptop copy (`X:\Foto Editor`) had gone on to build a tone/color
+  curves editor, HDR/focus stacking, histogram polish, a GUI-freeze fix,
+  and maximized launch (commits `22a7819`..`0913b43`, 2026-08-09 through
+  2026-08-12) while the desktop copy was simultaneously getting gradient
+  shapes, the hue slider, colored sliders, the spinbox-arrow fix, the
+  Foto->Photo rebrand, and auto-update -- two genuinely diverged histories
+  neither side knew about until the desktop copy pulled from a `laptop`
+  git remote pointed at this folder. Reconciled with `git merge` (not an
+  overwrite either direction) on a `merge-laptop-work` branch; only
+  `main.py` conflicted (`showMaximized()` vs `check_for_updates()` both
+  wanted the last lines of `main()`) and was resolved by keeping both.
+  Shipped as `1.10.0` -- see `CHANGELOG.md`. Two false alarms surfaced
+  while verifying the merge before trusting it, worth knowing about if
+  they come up again: (1) `python -c "EditorView(cat)"` (construct then
+  let the bare interpreter tear it down) crashes with a genuine
+  `STATUS_STACK_BUFFER_OVERRUN` on teardown -- reproduces on the laptop
+  commits alone, so it predates and is unrelated to the merge, and doesn't
+  happen in real usage (only when a Qt widget is torn down by interpreter
+  exit without `app.exec()` ever having run); (2) testing a real launch's
+  graceful-close cycle via PowerShell's `$proc.CloseMainWindow()` first
+  appeared to hang the process forever -- turned out to be testing the
+  wrong PID, since the venv's `pythonw.exe` **launcher stub re-execs a
+  child `pythonw.exe` process** that owns the actual window; the parent
+  stub PID has no window at all (`MainWindowHandle` 0). Check
+  `Get-CimInstance Win32_Process -Filter "ParentProcessId=<stub pid>"` to
+  find the real child before concluding a launch/close test failed.
 - **2026-08-28: auto-update added** (`app/updater.py`, `installer/publish.ps1`,
   `app/version.py`, `CHANGELOG.md`) -- see "Releasing a new version" above
   for the mechanics. Worth knowing if it ever seems to have stopped working:

@@ -18,6 +18,38 @@ git commits.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-08-29
+### Added
+- Tone/color curves editor alongside the existing sliders: an interactive
+  RGB (plus per-channel red/green/blue) curve, each drawn over its own
+  live histogram backdrop so you can see exactly where in the tonal range
+  a point lands before dragging it.
+- HDR and focus stacking: select a flat batch of photos in the library and
+  it auto-groups them into bursts by EXIF (capture time + exposure
+  settings), dedupes RAW+JPEG pairs, aligns each group (a downsampled
+  proxy for speed), then fuses exposure brackets with Mertens fusion or
+  blends focus brackets by Laplacian sharpness. A review dialog lets you
+  check and uncheck groups before committing.
+- The RGB histogram now explains itself with a caption instead of leaving
+  blank space underneath.
+- The app now launches maximized instead of at a fixed window size.
+### Fixed
+- A GUI freeze when reopening a folder mid-scan: `load_folder()` was
+  calling `QThread.wait()` on the GUI thread, which could deadlock against
+  the scan thread it was waiting on. Rewritten to never block the GUI
+  thread.
+### Notes
+This release reconciles two weeks of independent work: this laptop copy
+(curves, stacking, histogram polish, the freeze fix, maximized launch --
+commits `22a7819` through `0913b43`, 2026-08-09 through 2026-08-12) had
+diverged from the desktop copy (gradient shapes, hue shift, slider colors,
+the spinbox-arrow fix, the rebrand, and auto-update -- through `1.9.0`
+above) while the desktop copy was in active use during that window.
+Reconciled via `git merge`, not an overwrite in either direction; both
+sides' commit history is preserved. Verified post-merge: all modules
+import cleanly, the full updater test suite passes, and a real
+launch-to-graceful-close cycle works correctly.
+
 ## [1.9.0] - 2026-08-28
 ### Added
 - Auto-update: on launch, the installed app checks the NAS distribution
