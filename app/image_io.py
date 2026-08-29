@@ -7,6 +7,7 @@ decoded via rawpy (LibRaw); everything else goes through Pillow.
 
 import io
 import struct
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -201,6 +202,47 @@ def _read_tiff_exif_tags(path) -> tuple[dict, dict]:
             exif_ifd.load(f)
             sub_tags = {ExifTags.TAGS.get(k, k): v for k, v in exif_ifd.items()}
         return ifd0_tags, sub_tags
+
+
+def get_capture_datetime(path):
+    """Full-precision (down to the second) capture timestamp, for grouping
+    photos by *when* they were shot (e.g. detecting a burst/bracket for
+    stacking). Unlike get_exif_summary()'s "date" field -- intentionally
+    truncated to minute precision for display -- this is precise enough to
+    tell consecutive burst shots apart. Returns None if unavailable.
+
+    For RAW files this reads via the existing hand-rolled TIFF/IFD walk
+    (_read_tiff_exif_tags) rather than rawpy's raw.other.timestamp --
+    measured at ~10ms vs 1+ second per file for the rawpy accessor (it
+    appears to trigger a much broader metadata parse under the hood), which
+    matters a lot when this runs once per photo across a big selection."""
+    path = str(path)
+    if is_raw(path):
+        try:
+            ifd0_tags, sub_tags = _read_tiff_exif_tags(path)
+            raw_dt = ifd0_tags.get("DateTime")
+            if not raw_dt:
+                return None
+            dt = datetime.strptime(raw_dt, "%Y:%m:%d %H:%M:%S")
+            # One-second resolution is too coarse to order a fast burst --
+            # several shots often land in the same second. Fold in the
+            # sub-second EXIF field (a digit string for the fractional
+            # second, e.g. "774" meaning .774s) when the camera wrote one.
+            subsec = str(sub_tags.get("SubsecTimeOriginal") or sub_tags.get("SubsecTime") or "").strip()
+            if subsec.isdigit():
+                dt = dt.replace(microsecond=int(subsec.ljust(6, "0")[:6]))
+            return dt
+        except (ValueError, OSError):
+            return None
+    try:
+        with Image.open(path) as img:
+            tags = {ExifTags.TAGS.get(k, k): v for k, v in img.getexif().items()}
+            raw_dt = tags.get("DateTime")
+            if not raw_dt:
+                return None
+            return datetime.strptime(raw_dt, "%Y:%m:%d %H:%M:%S")
+    except (ValueError, OSError):
+        return None
 
 
 def get_exif_summary(path) -> dict:

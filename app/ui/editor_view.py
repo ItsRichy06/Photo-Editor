@@ -1493,6 +1493,14 @@ class EditorView(QWidget):
                 self.sliders[key] = slider
             layout.addWidget(box)
 
+        curves_box = QGroupBox("Curves")
+        curves_layout = QVBoxLayout(curves_box)
+        curves_layout.setContentsMargins(8, 6, 8, 6)
+        self.curve_editor = widgets.CurveEditor()
+        self.curve_editor.curveChanged.connect(self._on_curve_changed)
+        curves_layout.addWidget(self.curve_editor)
+        layout.addWidget(curves_box)
+
         crop_box = QGroupBox("Crop")
         crop_layout = QVBoxLayout(crop_box)
         crop_layout.setContentsMargins(8, 6, 8, 6)
@@ -1697,6 +1705,25 @@ class EditorView(QWidget):
         self._render_timer.start(30)
         self._history_timer.start(500)
 
+    def _on_curve_changed(self, channel: str, points: list):
+        # Reassign a new "curves" dict rather than mutating the existing one
+        # in place -- _commit_history() only shallow-copies self.recipe, so
+        # an in-place edit here would silently rewrite already-pushed history
+        # entries too (they'd still be holding a reference to this same
+        # nested dict), making undo/redo a no-op for curve changes.
+        curves = dict(self.recipe.get("curves") or processing.default_curves())
+        curves[channel] = points
+        self.recipe["curves"] = curves
+        self._render_timer.start(30)
+        self._history_timer.start(500)
+
+    def _update_histogram_displays(self, arr):
+        """Feeds the same rendered array to both the standalone histogram
+        panel and the curve editor's per-channel background histogram, so
+        they never show data from two different renders."""
+        self.histogram.set_image(arr)
+        self.curve_editor.set_histograms(widgets.compute_log_histograms(arr))
+
     def _render_preview(self):
         if self.preview_source is None:
             return
@@ -1704,7 +1731,7 @@ class EditorView(QWidget):
             # Trivial fast path -- no processing needed, no reason to bounce
             # through the background thread for this.
             self.canvas.set_pixmap(widgets.numpy_to_qpixmap(self.preview_source))
-            self.histogram.set_image(self.preview_source)
+            self._update_histogram_displays(self.preview_source)
             return
 
         recipe_for_render = self.recipe
@@ -1724,7 +1751,7 @@ class EditorView(QWidget):
             mask_for_overlay = self.pending_mask if self.pending_mask.dtype == bool else self.pending_mask > 0.3
             self.canvas.set_mask_overlay(mask_for_overlay)
         self.canvas.set_pixmap(widgets.numpy_to_qpixmap(out))
-        self.histogram.set_image(out)
+        self._update_histogram_displays(out)
 
     def _on_compare_toggle(self, checked: bool):
         self._show_original = checked
@@ -2221,6 +2248,7 @@ class EditorView(QWidget):
     def _sync_sliders_from_recipe(self):
         for key, widget in self.sliders.items():
             widget.set_value(self.recipe.get(key, 0.0))
+        self.curve_editor.set_curves(self.recipe.get("curves") or processing.default_curves())
 
     def _commit_history(self):
         if self.photo_id is None:

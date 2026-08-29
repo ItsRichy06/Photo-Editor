@@ -5,8 +5,18 @@ import math
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QPolygonF
-from PySide6.QtWidgets import QDoubleSpinBox, QHBoxLayout, QLabel, QSlider, QWidget
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtWidgets import (
+    QDoubleSpinBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .. import processing
 
 
 def pil_to_qpixmap(img: Image.Image) -> QPixmap:
@@ -189,6 +199,25 @@ class LabeledSlider(QWidget):
         self._updating = False
 
 
+def compute_log_histograms(arr: np.ndarray) -> dict:
+    """Per-channel + luminance histogram counts (256 bins, log-scaled so a
+    tall spike like a solid sky doesn't flatten the rest), keyed to match
+    CURVE_CHANNELS' "rgb"/"red"/"green"/"blue". NOT normalized to a peak --
+    shared raw data for HistogramWidget and CurveEditor, which each want a
+    different normalization (see their own set_image()/set_histograms())."""
+    img8 = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+    r = np.bincount(img8[..., 0].ravel(), minlength=256).astype(np.float32)
+    g = np.bincount(img8[..., 1].ravel(), minlength=256).astype(np.float32)
+    b = np.bincount(img8[..., 2].ravel(), minlength=256).astype(np.float32)
+    luminance = (
+        0.299 * img8[..., 0].astype(np.float32)
+        + 0.587 * img8[..., 1].astype(np.float32)
+        + 0.114 * img8[..., 2].astype(np.float32)
+    ).astype(np.uint8)
+    lum = np.bincount(luminance.ravel(), minlength=256).astype(np.float32)
+    return {"rgb": np.log1p(lum), "red": np.log1p(r), "green": np.log1p(g), "blue": np.log1p(b)}
+
+
 class HistogramWidget(QWidget):
     """Live histogram of the currently rendered preview image, drawn as two
     separate charts (each normalized to its own peak) rather than one
@@ -198,26 +227,17 @@ class HistogramWidget(QWidget):
 
     LABEL_H = 14
     GAP = 6
+    CAPTION_H = 46
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(160)
+        self.setMinimumHeight(160 + self.CAPTION_H)
         self._channels = None  # (r, g, b) each a length-256 float array normalized 0..1
         self._luminance = None  # length-256 float array normalized 0..1
 
     def set_image(self, arr: np.ndarray):
-        img8 = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
-        r = np.bincount(img8[..., 0].ravel(), minlength=256).astype(np.float32)
-        g = np.bincount(img8[..., 1].ravel(), minlength=256).astype(np.float32)
-        b = np.bincount(img8[..., 2].ravel(), minlength=256).astype(np.float32)
-        luminance = (
-            0.299 * img8[..., 0].astype(np.float32)
-            + 0.587 * img8[..., 1].astype(np.float32)
-            + 0.114 * img8[..., 2].astype(np.float32)
-        ).astype(np.uint8)
-        lum_counts = np.bincount(luminance.ravel(), minlength=256).astype(np.float32)
-        # log-scale so a tall spike (e.g. a solid sky) doesn't flatten the rest
-        r, g, b, lum_counts = np.log1p(r), np.log1p(g), np.log1p(b), np.log1p(lum_counts)
+        hist = compute_log_histograms(arr)
+        r, g, b, lum_counts = hist["red"], hist["green"], hist["blue"], hist["rgb"]
         # Each chart normalizes against its own peak -- otherwise a much
         # taller luminance peak would flatten the RGB curves or vice versa.
         rgb_peak = max(r.max(), g.max(), b.max(), 1e-6)
@@ -228,20 +248,33 @@ class HistogramWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#181818"))
+
+        w = self.width()
+        font = painter.font()
+        font.setPointSize(8)
+        painter.setFont(font)
+
+        # Always drawn, even before a photo is open -- otherwise this whole
+        # widget is just empty black with no indication of what it's for.
+        caption_rect = QRect(2, self.height() - self.CAPTION_H, w - 4, self.CAPTION_H)
+        painter.setPen(QColor("#777777"))
+        painter.drawText(
+            caption_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+            "Left = dark, right = bright. A channel piled up at the right is near or fully "
+            "blown out (clipped).",
+        )
+
         if self._channels is None:
             return
 
-        w = self.width()
-        chart_h = max(10, (self.height() - 2 * self.LABEL_H - self.GAP) // 2)
+        chart_h = max(10, (self.height() - 2 * self.LABEL_H - self.GAP - self.CAPTION_H) // 2)
 
         top_label = QRect(2, 0, w - 4, self.LABEL_H)
         top_chart = QRect(0, self.LABEL_H, w, chart_h)
         bottom_label = QRect(2, self.LABEL_H + chart_h + self.GAP, w - 4, self.LABEL_H)
         bottom_chart = QRect(0, 2 * self.LABEL_H + chart_h + self.GAP, w, chart_h)
 
-        font = painter.font()
-        font.setPointSize(8)
-        painter.setFont(font)
         painter.setPen(QColor("#999999"))
         painter.drawText(top_label, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "Exposure")
         painter.drawText(bottom_label, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "Red / Green / Blue")
@@ -267,3 +300,329 @@ class HistogramWidget(QWidget):
             points.append(QPointF(x0 + w, y0 + h))
             points.append(QPointF(x0, y0 + h))
             painter.drawPolygon(QPolygonF(points))
+
+
+# (key, short label, accent color) for each editable curve channel -- the
+# master "rgb" curve plus one per color channel for color grading (e.g.
+# lifting blue specifically in the shadows without touching red/green).
+CURVE_CHANNELS = [
+    ("rgb", "RGB", QColor(230, 230, 230)),
+    ("red", "R", QColor(255, 90, 90)),
+    ("green", "G", QColor(90, 220, 90)),
+    ("blue", "B", QColor(110, 150, 255)),
+]
+
+
+def _curve_channel_button_style(color: QColor) -> str:
+    c = color.name()
+    return f"""
+        QPushButton {{
+            background: #262626; color: {c}; border: 1px solid #3a3a3a;
+            border-radius: 3px; padding: 2px 8px; font-weight: bold;
+        }}
+        QPushButton:checked {{ background: #333333; border: 1px solid {c}; }}
+        QPushButton:hover {{ border: 1px solid {c}; }}
+    """
+
+
+class _CurveCanvas(QWidget):
+    """The actual draggable plot -- click empty space to add a point, drag a
+    point to move it, double-click (or right-click) a point to remove it.
+    Only one channel is interactive at a time (the active one); the others
+    are drawn dim in the background as a reference if they've been touched.
+    """
+
+    pointsChanged = Signal(list)  # emitted with the *active* channel's new points
+
+    # Generous hit tolerance -- a precise click on a 4px dot is an
+    # unreasonable ask, and (per this app's own past gradient-tool bug) a
+    # miss should never feel like "nothing happened" or do the wrong thing.
+    HIT_RADIUS_PX = 10
+    MAX_POINTS = 20
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(180)
+        self.setMouseTracking(True)
+        self._curves = {key: [[0.0, 0.0], [1.0, 1.0]] for key, _, _ in CURVE_CHANNELS}
+        self._active = "rgb"
+        self._drag_index = None
+        self._hover_index = None
+        self._pad = 8.0
+        self._histograms = None  # {"rgb"/"red"/"green"/"blue": raw log-scaled counts}, see set_histograms()
+
+    # -- geometry: 0..1 curve space <-> widget pixels, y flipped (up = brighter)
+    def _plot_rect(self) -> QRect:
+        p = int(self._pad)
+        return QRect(p, p, max(1, self.width() - 2 * p), max(1, self.height() - 2 * p))
+
+    def _to_widget(self, x: float, y: float) -> QPointF:
+        r = self._plot_rect()
+        return QPointF(r.left() + x * r.width(), r.bottom() - y * r.height())
+
+    def _to_curve(self, pos) -> tuple[float, float]:
+        r = self._plot_rect()
+        x = (pos.x() - r.left()) / max(1, r.width())
+        y = (r.bottom() - pos.y()) / max(1, r.height())
+        return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+
+    # -- data
+    def set_curves(self, curves: dict):
+        for key, _, _ in CURVE_CHANNELS:
+            pts = curves.get(key) or [[0.0, 0.0], [1.0, 1.0]]
+            self._curves[key] = [[float(x), float(y)] for x, y in pts]
+        self._drag_index = None
+        self._hover_index = None
+        self.update()
+
+    def curves(self) -> dict:
+        return {k: [list(p) for p in v] for k, v in self._curves.items()}
+
+    def set_histograms(self, histograms: dict | None):
+        """histograms: compute_log_histograms()'s output, or None to clear
+        (e.g. no photo open). Each channel's curve is drawn against *that
+        channel's own* histogram -- so switching to Red shows where red is
+        actually clipping/bunched, not the overall exposure -- normalized
+        to its own peak (unlike HistogramWidget's shared-peak R/G/B
+        chart), since only one channel's histogram is ever shown here at a
+        time and should fill the plot regardless of which channel it is."""
+        self._histograms = histograms
+        self.update()
+
+    def active_channel(self) -> str:
+        return self._active
+
+    def set_active(self, key: str):
+        if key not in self._curves:
+            return
+        self._active = key
+        self._drag_index = None
+        self._hover_index = None
+        self.update()
+
+    def reset_active(self):
+        identity = [[0.0, 0.0], [1.0, 1.0]]
+        self._curves[self._active] = identity
+        self._drag_index = None
+        self.update()
+        self.pointsChanged.emit([list(p) for p in identity])
+
+    # -- painting
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#181818"))
+
+        r = self._plot_rect()
+        painter.setPen(QColor("#262626"))
+        painter.setBrush(QColor("#101010"))
+        painter.drawRect(r)
+
+        if self._histograms is not None:
+            channel_colors = {key: color for key, _, color in CURVE_CHANNELS}
+            counts = self._histograms.get(self._active)
+            if counts is not None and counts.max() > 0:
+                self._draw_histogram_bg(painter, r, counts / counts.max(), channel_colors[self._active])
+
+        painter.setPen(QPen(QColor("#242424"), 1))
+        for i in (1, 2):
+            gx = r.left() + r.width() * i / 3
+            gy = r.top() + r.height() * i / 3
+            painter.drawLine(QPointF(gx, r.top()), QPointF(gx, r.bottom()))
+            painter.drawLine(QPointF(r.left(), gy), QPointF(r.right(), gy))
+
+        painter.setPen(QPen(QColor("#3a3a3a"), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(self._to_widget(0.0, 0.0), self._to_widget(1.0, 1.0))
+
+        by_key = {key: (label, color) for key, label, color in CURVE_CHANNELS}
+        order = [k for k in by_key if k != self._active] + [self._active]
+        for key in order:
+            points = self._curves[key]
+            is_active = key == self._active
+            if not is_active and processing.is_identity_curve(points):
+                continue  # don't clutter the plot with untouched reference channels
+            _, base_color = by_key[key]
+            color = QColor(base_color)
+            if not is_active:
+                color.setAlpha(90)
+            painter.setPen(QPen(color, 2 if is_active else 1))
+            lut = processing.curve_lut(points, size=64)
+            poly = QPolygonF([self._to_widget(i / (len(lut) - 1), float(v)) for i, v in enumerate(lut)])
+            painter.drawPolyline(poly)
+
+            if is_active:
+                for i, (x, y) in enumerate(points):
+                    pos = self._to_widget(x, y)
+                    hovered = i == self._hover_index or i == self._drag_index
+                    painter.setPen(QPen(QColor("#000000"), 1))
+                    painter.setBrush(QColor("#ffffff") if hovered else base_color)
+                    rad = 5.5 if hovered else 4.0
+                    painter.drawEllipse(pos, rad, rad)
+
+    @staticmethod
+    def _draw_histogram_bg(painter, rect: QRect, values: np.ndarray, color: QColor):
+        """Filled area chart of `values` (0..1, already normalized) behind
+        the curve -- same drawing approach as HistogramWidget's own charts,
+        just dim enough to stay a backdrop rather than compete with the
+        curve line and control points drawn on top of it."""
+        dim = QColor(color)
+        dim.setAlpha(70)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(dim)
+        n = len(values)
+        x0, y0, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+        points = [QPointF(x0 + i / (n - 1) * w, y0 + h - float(v) * h) for i, v in enumerate(values)]
+        points.append(QPointF(x0 + w, y0 + h))
+        points.append(QPointF(x0, y0 + h))
+        painter.drawPolygon(QPolygonF(points))
+
+    # -- mouse interaction
+    def _hit_test(self, pos):
+        points = self._curves[self._active]
+        best_i, best_d2 = None, self.HIT_RADIUS_PX ** 2
+        for i, (x, y) in enumerate(points):
+            p = self._to_widget(x, y)
+            d2 = (p.x() - pos.x()) ** 2 + (p.y() - pos.y()) ** 2
+            if d2 <= best_d2:
+                best_d2, best_i = d2, i
+        return best_i
+
+    def _insert_point(self, pos):
+        points = self._curves[self._active]
+        if len(points) >= self.MAX_POINTS:
+            return None
+        x, y = self._to_curve(pos)
+        x = min(max(x, 1e-4), 1 - 1e-4)  # those slots belong to the fixed endpoints
+        idx = len(points)
+        for i, (px, _py) in enumerate(points):
+            if px > x:
+                idx = i
+                break
+        points.insert(idx, [x, y])
+        return idx
+
+    def _drag_point(self, pos):
+        points = self._curves[self._active]
+        i = self._drag_index
+        if i is None or i >= len(points):
+            return
+        x, y = self._to_curve(pos)
+        if i == 0:
+            x = 0.0
+        elif i == len(points) - 1:
+            x = 1.0
+        else:
+            x = min(max(x, points[i - 1][0] + 1e-4), points[i + 1][0] - 1e-4)
+        points[i][0], points[i][1] = x, y
+        self.update()
+        self.pointsChanged.emit([list(p) for p in points])
+
+    def _remove_point(self, i):
+        points = self._curves[self._active]
+        if i is None or i == 0 or i == len(points) - 1 or len(points) <= 2:
+            return  # endpoints are permanent; a curve always keeps >= 2 points
+        points.pop(i)
+        self._drag_index = None
+        self._hover_index = None
+        self.update()
+        self.pointsChanged.emit([list(p) for p in points])
+
+    def mousePressEvent(self, event):
+        pos = event.position()
+        if event.button() == Qt.MouseButton.RightButton:
+            self._remove_point(self._hit_test(pos))
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        i = self._hit_test(pos)
+        if i is None:
+            i = self._insert_point(pos)
+        if i is not None:
+            self._drag_index = i
+            self._drag_point(pos)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        if self._drag_index is not None:
+            self._drag_point(pos)
+            return
+        new_hover = self._hit_test(pos)
+        if new_hover != self._hover_index:
+            self._hover_index = new_hover
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_index is not None:
+            self._drag_index = None
+            self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        self._remove_point(self._hit_test(event.position()))
+
+    def leaveEvent(self, event):
+        if self._hover_index is not None:
+            self._hover_index = None
+            self.update()
+
+
+class CurveEditor(QWidget):
+    """Tone/color curve editor: draggable control points mapping input
+    brightness to output brightness, one curve per channel (master "RGB"
+    plus individual Red/Green/Blue for color grading). Complements the
+    Light/Color sliders with the same finer control curves give in any
+    other photo editor -- e.g. an S-curve that pinches contrast only in the
+    midtones while leaving the extreme shadows/highlights alone, which no
+    single slider here can express, or lifting blue specifically in the
+    shadows for a cooler look without touching the rest of the tonal range.
+    """
+
+    curveChanged = Signal(str, list)  # (channel key, new [[x, y], ...] points)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(2)
+        self._buttons = {}
+        for key, label, color in CURVE_CHANNELS:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setFixedHeight(22)
+            btn.setStyleSheet(_curve_channel_button_style(color))
+            btn.clicked.connect(lambda _checked, k=key: self._set_active(k))
+            button_row.addWidget(btn)
+            self._buttons[key] = btn
+        self._buttons["rgb"].setChecked(True)
+        button_row.addStretch(1)
+        reset_btn = QPushButton("Reset")
+        reset_btn.setFixedHeight(22)
+        reset_btn.clicked.connect(self._canvas_reset)
+        button_row.addWidget(reset_btn)
+        layout.addLayout(button_row)
+
+        self._canvas = _CurveCanvas()
+        self._canvas.pointsChanged.connect(self._on_points_changed)
+        layout.addWidget(self._canvas)
+
+    def _set_active(self, key: str):
+        for k, btn in self._buttons.items():
+            btn.setChecked(k == key)
+        self._canvas.set_active(key)
+
+    def _canvas_reset(self):
+        self._canvas.reset_active()
+
+    def _on_points_changed(self, points):
+        self.curveChanged.emit(self._canvas.active_channel(), points)
+
+    def set_curves(self, curves: dict):
+        self._canvas.set_curves(curves)
+
+    def curves(self) -> dict:
+        return self._canvas.curves()
+
+    def set_histograms(self, histograms: dict | None):
+        self._canvas.set_histograms(histograms)
