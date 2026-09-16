@@ -18,6 +18,33 @@ git commits.
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-09-16
+### Added
+- Auto Enhance: a one-click button in the editor that has a local
+  multimodal AI model (Qwen2.5-VL-7B-Instruct) look at the open photo and
+  suggest exposure, contrast, highlights/shadows/whites/blacks, white
+  balance, and saturation/vibrance -- runs entirely on-device, no photo
+  data leaves the machine. The one-time ~16GB model download only starts
+  after an explicit in-app Yes/No confirmation naming the model, size,
+  and source; declining leaves the button a no-op, and nothing about it
+  is tied to the auto-updater.
+### Fixed
+- AI Select's mask now respects the Feather slider. SAM2 only ever
+  returns a hard-edged mask, and the Feather slider -- visibly sitting
+  right there in the panel while AI Select was active -- silently did
+  nothing to it, so a local adjustment (e.g. brightening a selected
+  subject) cut off sharply at the selection boundary instead of blending
+  in. The mask is now Gaussian-blurred by the Feather value, re-softening
+  live as the slider moves.
+- Reopening an existing mask layer to tweak its sliders was silently
+  hardening its edge back to a binary cutout, discarding any feather
+  (Brush/Gradient included) the moment it was re-edited.
+- The library grid now loads whatever's actually on screen first instead
+  of plain folder-scan order -- with a large library (order of 10,000+
+  photos), the thumbnails you're actually looking at used to sit behind
+  everything alphabetically/chronologically earlier in the queue. Now
+  prioritized on initial open and as you scroll.
+
 ## [1.10.0] - 2026-08-29
 ### Added
 - Tone/color curves editor alongside the existing sliders: an interactive
