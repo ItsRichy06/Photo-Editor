@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import image_io, processing, segmentation
-from ..settings import LAST_EXPORT_FOLDER, get_settings
+from .. import auto_enhance, image_io, processing, segmentation
+from ..settings import AUTO_ENHANCE_CONSENT, LAST_EXPORT_FOLDER, get_settings
 from . import widgets
 
 PREVIEW_MAX_DIM = 2400  # long-edge px for the interactive-editing preview (full-res
@@ -1147,6 +1147,27 @@ class SegmentationThread(QThread):
         self.result_ready.emit(mask)
 
 
+class AutoEnhanceThread(QThread):
+    """Runs the local Auto Enhance model (see app/auto_enhance.py) off the UI
+    thread -- first-use model load (an ~16GB one-time download, then loading
+    those weights onto the GPU) and inference itself can both take a while,
+    which would otherwise freeze the app."""
+
+    result_ready = Signal(object)  # {"adjustments": {...}, "reasoning": str}
+
+    def __init__(self, image):
+        super().__init__()
+        self.image = image
+
+    def run(self):
+        try:
+            result = auto_enhance.suggest_adjustments(self.image)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[auto-enhance] thread failed: {exc}")
+            result = {"adjustments": {key: 0.0 for key in auto_enhance.RECIPE_FIELDS}, "reasoning": ""}
+        self.result_ready.emit(result)
+
+
 class PreviewRenderThread(QThread):
     """Persistent background worker that runs apply_recipe() off the UI
     thread. Rendering used to happen directly inside the debounce-timer
@@ -1288,6 +1309,7 @@ class EditorView(QWidget):
         self.pending_adjustments = processing.default_local_adjustments()
         self.editing_layer_index = None  # index into recipe['local_adjustments'] being re-edited, or None
         self.seg_thread = None
+        self.auto_thread = None
         self._last_brush_pos = None  # (img_x, img_y) of the previous stroke point, for interpolation
         self._last_gradient_geom = None  # ("linear"|"radial", x0,y0,x1,y1) or ("polygon", points) -- lets
         # Invert/Feather changes recompute the current shape without needing a fresh drag
@@ -1478,6 +1500,21 @@ class EditorView(QWidget):
 
         self.histogram = widgets.HistogramWidget()
         layout.addWidget(self.histogram)
+
+        self.auto_enhance_btn = QPushButton("Auto Enhance")
+        self.auto_enhance_btn.setToolTip(
+            "Let a local AI model look at this photo and suggest exposure, contrast, "
+            "white balance, and color adjustments -- runs entirely on this machine, "
+            "first use downloads the model (~16GB, one time)."
+        )
+        self.auto_enhance_btn.clicked.connect(self._on_auto_enhance_clicked)
+        layout.addWidget(self.auto_enhance_btn)
+
+        self.auto_enhance_status = QLabel("")
+        self.auto_enhance_status.setWordWrap(True)
+        self.auto_enhance_status.setStyleSheet("color: #999999; font-size: 11px;")
+        self.auto_enhance_status.setVisible(False)
+        layout.addWidget(self.auto_enhance_status)
 
         for title, specs in SLIDER_GROUPS:
             box = QGroupBox(title)
@@ -1752,6 +1789,49 @@ class EditorView(QWidget):
             self.canvas.set_mask_overlay(mask_for_overlay)
         self.canvas.set_pixmap(widgets.numpy_to_qpixmap(out))
         self._update_histogram_displays(out)
+
+    def _on_auto_enhance_clicked(self):
+        if self.preview_source is None or (self.auto_thread is not None and self.auto_thread.isRunning()):
+            return
+        if not auto_enhance.is_model_loaded() and not self.settings.value(AUTO_ENHANCE_CONSENT, False, type=bool):
+            choice = QMessageBox.question(
+                self,
+                "Download local AI model?",
+                "Auto Enhance uses a local AI model (Qwen2.5-VL-7B, ~16GB) that runs "
+                "entirely on this machine -- nothing about your photos is sent anywhere. "
+                "The first use downloads and caches those model weights from Hugging Face "
+                "(huggingface.co); after that it's instant to reuse.\n\n"
+                "Download it now and enable Auto Enhance?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if choice != QMessageBox.StandardButton.Yes:
+                return
+            self.settings.setValue(AUTO_ENHANCE_CONSENT, True)
+        self.auto_enhance_btn.setEnabled(False)
+        self.auto_enhance_status.setText(
+            "Analyzing…" if auto_enhance.is_model_loaded() else "Loading local AI model (first use only)…"
+        )
+        self.auto_enhance_status.setVisible(True)
+        self.auto_thread = AutoEnhanceThread(self.preview_source)
+        self.auto_thread.result_ready.connect(self._on_auto_enhance_result)
+        self.auto_thread.start()
+
+    def _on_auto_enhance_result(self, result):
+        self.auto_enhance_btn.setEnabled(True)
+        adjustments = result.get("adjustments") or {}
+        reasoning = result.get("reasoning") or ""
+        if not adjustments or not any(adjustments.values()):
+            self.auto_enhance_status.setText(
+                reasoning or "Auto Enhance couldn't suggest changes for this photo (see log for details)."
+            )
+            return
+        for key, value in adjustments.items():
+            self.recipe[key] = value
+        self._sync_sliders_from_recipe()
+        self._render_preview()
+        self._commit_history()
+        self.auto_enhance_status.setText(reasoning or "Adjustments applied.")
 
     def _on_compare_toggle(self, checked: bool):
         self._show_original = checked
