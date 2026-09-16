@@ -8,14 +8,17 @@ cells actually in the viewport, and thumbnail generation itself is farmed out
 across a thread pool instead of done one file at a time.
 """
 
+import itertools
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import (
     QAbstractListModel,
     QEvent,
     QModelIndex,
+    QPoint,
     QPointF,
     QRect,
     QSize,
@@ -267,6 +270,16 @@ class PhotoDelegate(QStyledItemDelegate):
 
 
 class ThumbnailLoaderThread(QThread):
+    """Loads thumbnails for a whole folder on a worker pool, off a priority
+    queue rather than a flat FIFO -- with a few thousand+ photos, loading in
+    plain scan order means whatever the user actually has on screen is stuck
+    behind everything alphabetically/chronologically earlier in the folder.
+    `prioritize()` lets the GUI thread bump the photos currently visible (or
+    about to be) to the front of the queue as the user opens or scrolls the
+    library, so what's on screen finishes first; everything else still loads
+    in the background at the same total speed.
+    """
+
     scan_registered = Signal(list)  # list of (photo_dict, is_raw), emitted once
     photo_ready = Signal(int, object)  # photo_id, PIL.Image
     finished_scanning = Signal(int)
@@ -279,9 +292,52 @@ class ThumbnailLoaderThread(QThread):
         self.thumb_size = thumb_size
         self.max_workers = max_workers or min(8, os.cpu_count() or 4)
         self._stop = False
+        # Set up before scan_registered is emitted (see run()) so prioritize()
+        # is always safe to call as soon as the GUI has photo ids to give it.
+        self._path_by_id = {}
+        self._work_queue = queue.PriorityQueue()
+        self._seq = itertools.count()
+        self._claimed_lock = threading.Lock()
+        self._claimed = set()
+        self._done_count = 0
 
     def stop(self):
         self._stop = True
+
+    def prioritize(self, photo_ids):
+        """Bump these photo ids to the front of the load queue. Safe to call
+        from the GUI thread at any point after scan_registered has fired
+        (before that, self._path_by_id is empty and this is a no-op)."""
+        with self._claimed_lock:
+            claimed = self._claimed
+        for pid in photo_ids:
+            if pid in claimed:
+                continue
+            path = self._path_by_id.get(pid)
+            if path is None:
+                continue
+            self._work_queue.put((0, next(self._seq), pid, path))
+
+    def _worker(self):
+        while not self._stop:
+            try:
+                _, _, pid, path = self._work_queue.get_nowait()
+            except queue.Empty:
+                return
+            with self._claimed_lock:
+                if pid in self._claimed:
+                    continue
+                self._claimed.add(pid)
+            try:
+                thumb = thumbnails.get_thumbnail(path, self.thumb_size)
+            except Exception as exc:  # noqa: BLE001 - keep going past a bad file
+                print(f"[library] failed to load {path}: {exc}")
+                continue
+            if self._stop:
+                return
+            self.photo_ready.emit(pid, thumb)
+            with self._claimed_lock:
+                self._done_count += 1
 
     def run(self):
         paths = list(image_io.scan_folder(self.folder, self.recursive))
@@ -299,29 +355,24 @@ class ThumbnailLoaderThread(QThread):
                 continue
             path_by_id[photo["id"]] = p
             registered.append((photo, image_io.is_raw(p)))
+
+        # Populate the queue (default/low priority) before announcing the
+        # scan -- once scan_registered is emitted the GUI thread may call
+        # prioritize() at any moment, and it needs self._path_by_id and
+        # self._work_queue to already exist and be in their normal state.
+        self._path_by_id = path_by_id
+        for pid, p in path_by_id.items():
+            self._work_queue.put((1, next(self._seq), pid, p))
+
         self.scan_registered.emit(registered)
 
-        done = 0
-        executor = ThreadPoolExecutor(max_workers=self.max_workers)
-        try:
-            future_to_id = {
-                executor.submit(thumbnails.get_thumbnail, p, self.thumb_size): pid
-                for pid, p in path_by_id.items()
-            }
-            for future in as_completed(future_to_id):
-                if self._stop:
-                    break
-                pid = future_to_id[future]
-                try:
-                    thumb = future.result()
-                except Exception as exc:  # noqa: BLE001 - keep going past a bad file
-                    print(f"[library] failed to load {path_by_id[pid]}: {exc}")
-                    continue
-                self.photo_ready.emit(pid, thumb)
-                done += 1
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-        self.finished_scanning.emit(done)
+        workers = [threading.Thread(target=self._worker, daemon=True) for _ in range(self.max_workers)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+
+        self.finished_scanning.emit(self._done_count)
 
 
 class LibraryView(QWidget):
@@ -405,6 +456,15 @@ class LibraryView(QWidget):
         self.list_view.setItemDelegate(self.delegate)
         self.list_view.doubleClicked.connect(self._on_double_clicked)
         main_layout.addWidget(self.list_view, stretch=1)
+
+        # Debounced so a fast scroll/drag doesn't re-walk the viewport on
+        # every single pixel of movement -- one pass ~150ms after motion
+        # settles is plenty responsive and far cheaper.
+        self._prioritize_timer = QTimer(self)
+        self._prioritize_timer.setSingleShot(True)
+        self._prioritize_timer.setInterval(150)
+        self._prioritize_timer.timeout.connect(self._prioritize_visible)
+        self.list_view.verticalScrollBar().valueChanged.connect(lambda _: self._prioritize_timer.start())
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._install_shortcuts()
@@ -500,6 +560,41 @@ class LibraryView(QWidget):
     def _on_scan_registered(self, registered: list):
         self.model.add_photos(registered)
         self.status_label.setText(f"{len(registered)} photos, loading thumbnails…")
+        # The view needs a layout pass over the newly-added rows before it can
+        # report what's actually visible -- that happens on the next event
+        # loop iteration, which a 0ms singleShot lands right after.
+        QTimer.singleShot(0, self._prioritize_visible)
+
+    def _prioritize_visible(self):
+        """Tell the loader thread to load whatever's currently on screen (plus
+        a screen's worth of buffer above/below, so scrolling stays ahead of
+        the queue) before the rest of the folder."""
+        thread = self.loader_thread
+        if thread is None or not thread.isRunning():
+            return
+        viewport_rect = self.list_view.viewport().rect()
+        if viewport_rect.isEmpty():
+            return
+        buffer = viewport_rect.height()
+        scan_rect = viewport_rect.adjusted(0, -buffer, 0, buffer)
+
+        step_x = max(1, CELL_W // 2)
+        step_y = max(1, CELL_H // 2)
+        photo_ids = set()
+        y = scan_rect.top()
+        while y <= scan_rect.bottom():
+            x = scan_rect.left()
+            while x <= scan_rect.right():
+                index = self.list_view.indexAt(QPoint(x, y))
+                if index.isValid():
+                    pid = index.data(PhotoListModel.PhotoIdRole)
+                    if pid is not None:
+                        photo_ids.add(pid)
+                x += step_x
+            y += step_y
+
+        if photo_ids:
+            thread.prioritize(photo_ids)
 
     def _on_photo_ready(self, photo_id: int, pil_thumb):
         pixmap = widgets.pil_to_qpixmap(pil_thumb)
