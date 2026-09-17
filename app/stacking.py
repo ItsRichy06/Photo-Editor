@@ -272,6 +272,22 @@ def detect_stacks(infos: list) -> tuple[list, list]:
 # to the full-resolution image (a single warp is comparatively cheap; only
 # the iterative search benefits from working at full size).
 ECC_PROXY_MAX_DIM = 1000
+# Focus stacks need a much higher-resolution proxy than HDR brackets do.
+# Any error in the warp found on the proxy gets amplified by 1/scale when
+# it's scaled up to the full-resolution image (see _scale_warp) -- at the
+# default 1000px proxy, a real 6240px-wide photo has scale ~1/6.2, so an
+# under-a-pixel error on the proxy becomes several pixels of real
+# misalignment at full resolution. That's invisible in a smooth photo but
+# very visible in a focus stack's per-pixel sharpest-frame blending, which
+# is exactly what caused visible ghosting/haze on a real macro stack even
+# after switching to subject-masked alignment (see _align_ecc) -- fixed by
+# raising the proxy resolution specifically for focus stacks, confirmed
+# against that same real photo set at its true full resolution (not a
+# downsampled preview, which hides this exact problem). HDR brackets don't
+# need this: Mertens fusion blends smoothly across all frames rather than
+# picking a single "winner" per pixel, so it's far less sensitive to a few
+# pixels of residual misalignment.
+FOCUS_ECC_PROXY_MAX_DIM = 2600
 
 
 def _downsample_gray(img_float: np.ndarray, max_dim: int) -> tuple:
@@ -330,7 +346,9 @@ def _auto_subject_mask(ref_proxy: np.ndarray):
     return (labels == largest).astype(np.uint8) * 255
 
 
-def _align_ecc(images_float: list, ref_index: int, motion_type, use_subject_mask: bool = False) -> list:
+def _align_ecc(
+    images_float: list, ref_index: int, motion_type, use_subject_mask: bool = False, proxy_max_dim: int = ECC_PROXY_MAX_DIM
+) -> list:
     """Align every image in images_float onto images_float[ref_index] via
     ECC (Enhanced Correlation Coefficient). Used for both HDR and focus
     stacks (with a different motion model -- see callers below): ECC is,
@@ -355,7 +373,7 @@ def _align_ecc(images_float: list, ref_index: int, motion_type, use_subject_mask
     breathing -- was measurably different once the fit was restricted to
     the subject), and switching to a subject-masked fit visibly fixed it.
     """
-    ref_proxy, scale = _downsample_gray(images_float[ref_index], ECC_PROXY_MAX_DIM)
+    ref_proxy, scale = _downsample_gray(images_float[ref_index], proxy_max_dim)
     mask = _auto_subject_mask(ref_proxy) if use_subject_mask else None
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
     h, w = images_float[ref_index].shape[:2]
@@ -365,7 +383,7 @@ def _align_ecc(images_float: list, ref_index: int, motion_type, use_subject_mask
         if i == ref_index:
             aligned.append(img)
             continue
-        proxy, _ = _downsample_gray(img, ECC_PROXY_MAX_DIM)
+        proxy, _ = _downsample_gray(img, proxy_max_dim)
         warp = np.eye(warp_size, 3, dtype=np.float32)
         try:
             try:
@@ -408,8 +426,13 @@ def _align_homography(images_float: list, ref_index: int) -> list:
     lens's field of view subtly changing across its focus range) means a
     simpler motion model isn't always enough. use_subject_mask=True since
     it's specifically the subject (not the whole frame) that a focus stack
-    needs to end up sharp -- see _align_ecc's docstring."""
-    return _align_ecc(images_float, ref_index, cv2.MOTION_HOMOGRAPHY, use_subject_mask=True)
+    needs to end up sharp; proxy_max_dim is raised well above the default
+    (see FOCUS_ECC_PROXY_MAX_DIM) since a focus stack's per-pixel frame
+    selection is far more sensitive to residual misalignment than a smooth
+    photo is -- see _align_ecc's docstring."""
+    return _align_ecc(
+        images_float, ref_index, cv2.MOTION_HOMOGRAPHY, use_subject_mask=True, proxy_max_dim=FOCUS_ECC_PROXY_MAX_DIM
+    )
 
 
 # ------------------------------------------------------------------ merge
