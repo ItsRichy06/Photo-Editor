@@ -18,6 +18,12 @@ git commits.
 
 ## [Unreleased]
 
+## [1.11.5] - 2026-09-17
+### Added
+- The library now recognizes .tif/.tiff files, so a photo exported from
+  elsewhere (e.g. another tool's stacking output) can be reopened here
+  for further editing, not just this app's own JPEG/RAW originals.
+
 ## [1.11.4] - 2026-09-17
 ### Changed
 - Focus-stack alignment now chains each frame onto its already-aligned
