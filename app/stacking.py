@@ -384,7 +384,12 @@ def _auto_subject_mask(proxies):
 
 
 def _align_ecc(
-    images_float: list, ref_index: int, motion_type, use_subject_mask: bool = False, proxy_max_dim: int = ECC_PROXY_MAX_DIM
+    images_float: list,
+    ref_index: int,
+    motion_type,
+    use_subject_mask: bool = False,
+    proxy_max_dim: int = ECC_PROXY_MAX_DIM,
+    chain: bool = False,
 ) -> list:
     """Align every image in images_float onto images_float[ref_index] via
     ECC (Enhanced Correlation Coefficient). Used for both HDR and focus
@@ -434,16 +439,18 @@ def _align_ecc(
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
     h, w = images_float[ref_index].shape[:2]
     warp_size = 3 if motion_type == cv2.MOTION_HOMOGRAPHY else 2
-    aligned = []
-    for i, img in enumerate(images_float):
-        if i == ref_index:
-            aligned.append(img)
-            continue
+    n = len(images_float)
+
+    def align_one(template_proxy, i):
+        """Aligns images_float[i] onto template_proxy (already in the
+        reference frame's coordinate system, at proxy_max_dim scale) and
+        returns the full-resolution result."""
+        img = images_float[i]
         proxy, _ = _downsample_gray(img, proxy_max_dim)
         warp = np.eye(warp_size, 3, dtype=np.float32)
         try:
             try:
-                _, warp = cv2.findTransformECC(ref_proxy, proxy, warp, motion_type, criteria, mask, 5)
+                _, warp = cv2.findTransformECC(template_proxy, proxy, warp, motion_type, criteria, mask, 5)
             except cv2.error:
                 if mask is None:
                     raise
@@ -452,7 +459,7 @@ def _align_ecc(
                 # focus distance) -- retry against the whole frame rather
                 # than giving up and leaving this frame fully unaligned.
                 warp = np.eye(warp_size, 3, dtype=np.float32)
-                _, warp = cv2.findTransformECC(ref_proxy, proxy, warp, motion_type, criteria, None, 5)
+                _, warp = cv2.findTransformECC(template_proxy, proxy, warp, motion_type, criteria, None, 5)
             warp = _scale_warp(warp, scale)
             if warp_size == 3:
                 out = cv2.warpPerspective(
@@ -464,9 +471,45 @@ def _align_ecc(
                     img, warp, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_REPLICATE,
                 )
+            return out, True
         except cv2.error:
-            out = img  # didn't converge either way -- fall back to the unaligned frame rather than failing the whole stack
-        aligned.append(out)
+            return img, False  # didn't converge either way -- fall back to the unaligned frame rather than failing the whole stack
+
+    aligned = [None] * n
+    aligned[ref_index] = images_float[ref_index]
+
+    if not chain:
+        for i in range(n):
+            if i != ref_index:
+                aligned[i], _ = align_one(ref_proxy, i)
+        return aligned
+
+    # Chain mode: align each frame onto its already-aligned NEIGHBOR instead
+    # of jumping straight to one shared reference frame. A frame far from
+    # the reference (e.g. the first frame in a 35-frame stack aligned
+    # against the middle one) has accumulated far more focus breathing to
+    # correct in a single fit than an adjacent pair does -- confirmed on a
+    # real photo: a region that was genuinely sharp in the *first* source
+    # frame still came out soft in the final stack, because that frame's
+    # single big jump to the reference wasn't quite accurate enough, even
+    # with subject-masking. Chaining keeps every individual alignment step
+    # to one frame's worth of change, however many frames the stack has.
+    # On a step that fails to converge, the chain continues from the last
+    # successfully-aligned frame rather than advancing onto a fallback
+    # unaligned frame, so one bad link doesn't drag every frame after it
+    # out of alignment too.
+    template_proxy = ref_proxy
+    for i in range(ref_index + 1, n):
+        out, ok = align_one(template_proxy, i)
+        aligned[i] = out
+        if ok:
+            template_proxy, _ = _downsample_gray(out, proxy_max_dim)
+    template_proxy = ref_proxy
+    for i in range(ref_index - 1, -1, -1):
+        out, ok = align_one(template_proxy, i)
+        aligned[i] = out
+        if ok:
+            template_proxy, _ = _downsample_gray(out, proxy_max_dim)
     return aligned
 
 
@@ -485,9 +528,19 @@ def _align_homography(images_float: list, ref_index: int) -> list:
     needs to end up sharp; proxy_max_dim is raised well above the default
     (see FOCUS_ECC_PROXY_MAX_DIM) since a focus stack's per-pixel frame
     selection is far more sensitive to residual misalignment than a smooth
-    photo is -- see _align_ecc's docstring."""
+    photo is; chain=True aligns each frame onto its already-aligned
+    neighbor rather than jumping straight to one shared reference frame --
+    see _align_ecc's docstring for why (confirmed necessary: a region
+    genuinely sharp in the source frame furthest from the reference still
+    came out soft in the merged stack without it, even with everything
+    else fixed)."""
     return _align_ecc(
-        images_float, ref_index, cv2.MOTION_HOMOGRAPHY, use_subject_mask=True, proxy_max_dim=FOCUS_ECC_PROXY_MAX_DIM
+        images_float,
+        ref_index,
+        cv2.MOTION_HOMOGRAPHY,
+        use_subject_mask=True,
+        proxy_max_dim=FOCUS_ECC_PROXY_MAX_DIM,
+        chain=True,
     )
 
 
