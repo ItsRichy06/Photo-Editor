@@ -18,6 +18,19 @@ git commits.
 
 ## [Unreleased]
 
+## [1.11.3] - 2026-09-17
+### Fixed
+- Focus-stacked photos could still show real ghosting (not just normal
+  background blur) in parts of the subject at a different depth than
+  wherever the alignment reference frame happened to be focused -- e.g. a
+  car's rear wing was still visibly doubled after 1.11.2, even though the
+  front of the car was clean. Two causes: the subject-detection mask was
+  silently failing at the resolution actually used and falling back to
+  the old whole-frame alignment with no visible sign anything was wrong,
+  and even once fixed, a mask built from only one frame can't see parts
+  of the subject that frame doesn't have in focus. Now detects the
+  subject from several frames spread across the stack instead of one.
+
 ## [1.11.2] - 2026-09-17
 ### Fixed
 - Focus-stacked photos could still come out visibly soft/hazy at their
