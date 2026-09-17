@@ -15,7 +15,12 @@ import rawpy
 from PIL import Image, ExifTags, ImageOps, TiffImagePlugin
 
 RAW_EXTENSIONS = {".arw"}
-STANDARD_EXTENSIONS = {".jpg", ".jpeg"}
+# .tif/.tiff included so a file exported from elsewhere (e.g. another
+# stacking/editing tool's TIFF output) can be reopened here for further
+# editing -- Image.open() already handles TIFF natively via Pillow, same
+# as JPEG, so no format-specific loading code was needed, just adding it
+# to the set of extensions the library scan/open dialogs recognize.
+STANDARD_EXTENSIONS = {".jpg", ".jpeg", ".tif", ".tiff"}
 SUPPORTED_EXTENSIONS = RAW_EXTENSIONS | STANDARD_EXTENSIONS
 
 
