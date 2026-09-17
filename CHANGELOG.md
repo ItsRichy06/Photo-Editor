@@ -18,6 +18,21 @@ git commits.
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-09-17
+### Fixed
+- Focus stacking: a real 35-frame macro stack was getting silently
+  chopped into a 30-frame group plus an orphaned "second stack" of
+  whatever the tail of the sequence happened to be -- a hardcoded 30-frame
+  cap on focus-stack group size, now raised to 100.
+- Focus-stacked photos with a subject that has real depth (not a flat
+  scene) could come out visibly soft/hazy even with well-aligned frames
+  (0.99+ correlation) -- alignment was fitting the *whole* frame, which
+  let a large plain background dominate the fit at the actual subject's
+  expense. Now restricts what focus-stack alignment optimizes against to
+  an auto-detected subject region, confirmed to fix real-world haze
+  caused by focus breathing (the lens's effective focal length shifting
+  across the focus range) on a subject with depth.
+
 ## [1.11.0] - 2026-09-16
 ### Added
 - Auto Enhance: a one-click button in the editor that has a local
