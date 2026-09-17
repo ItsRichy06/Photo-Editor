@@ -18,6 +18,18 @@ git commits.
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-09-17
+### Fixed
+- Focus-stacked photos could still come out visibly soft/hazy at their
+  true full resolution even after 1.11.1's subject-masked alignment fix
+  -- that fix was validated against a downsampled preview render, which
+  hides the actual problem: alignment searches for the best fit on a
+  small downsampled proxy image, then scales the result up to the real
+  photo, which amplifies any small error on the proxy into several pixels
+  of real misalignment once applied at full resolution. Fixed by using a
+  much higher-resolution proxy specifically for focus stacks; confirmed
+  against a real 35-frame macro stack at its true full resolution.
+
 ## [1.11.1] - 2026-09-17
 ### Fixed
 - Focus stacking: a real 35-frame macro stack was getting silently
