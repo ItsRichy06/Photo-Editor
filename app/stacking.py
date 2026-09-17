@@ -312,30 +312,67 @@ def _scale_warp(warp: np.ndarray, scale: float) -> np.ndarray:
     return (s @ warp.astype(np.float64) @ np.linalg.inv(s)).astype(np.float32)
 
 
-def _auto_subject_mask(ref_proxy: np.ndarray):
+def _auto_subject_mask(proxies):
     """Rough single-channel mask (uint8, 0/255) marking the busy/detailed
-    region of a grayscale reference proxy, as opposed to a large plain/
-    low-texture background -- used by _align_ecc's use_subject_mask to
-    keep alignment from being pulled around by a backdrop that dominates
-    the frame's pixel count but isn't the actual subject. Otsu-thresholds
-    a blurred Laplacian-energy map, then keeps only the single largest
-    connected blob, on the assumption that the subject is the largest
-    contiguous textured region in frame -- true for a clean single-subject
-    macro shot, not guaranteed for a busier scene. Returns None (falls
-    back to whole-frame alignment) if the result looks degenerate -- too
-    small a region to align against reliably, or so large it isn't
-    discriminating anything -- rather than risk making alignment worse on
-    a subject/background combination this wasn't validated against."""
-    energy = cv2.Laplacian(ref_proxy, cv2.CV_32F, ksize=5)
-    energy = cv2.GaussianBlur(np.abs(energy), (0, 0), sigmaX=6.0)
-    energy_u8 = cv2.normalize(energy, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    _, mask = cv2.threshold(energy_u8, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    region shared by one or more grayscale proxy images (same shape), as
+    opposed to a large plain/low-texture background -- used by
+    _align_ecc's use_subject_mask to keep alignment from being pulled
+    around by a backdrop that dominates the frame's pixel count but isn't
+    the actual subject.
+
+    proxies can be a single proxy or a list of them sampled across the
+    stack -- a focus stack's subject isn't equally sharp in any single
+    frame, so relying on just the alignment reference frame misses
+    whatever part of the subject happens to be out of focus *in that one
+    frame* (confirmed on a real photo: a car's rear wing, blurry in the
+    chosen reference frame, was invisible to a single-frame mask and so
+    never got aligned against). Each proxy's own Otsu-thresholded
+    Laplacian-energy map is unioned together before morphology/blob
+    selection, so a region only needs to be sharp in *any one* sampled
+    frame to count as part of the subject.
+
+    Falls back to None (whole-frame alignment) if the result looks
+    degenerate -- too small a region to align against reliably, or so
+    large it isn't discriminating anything -- rather than risk making
+    alignment worse on a subject/background combination this wasn't
+    validated against.
+
+    The blur/morphology sizes below were tuned against a 1000px-wide
+    proxy and are scaled relative to that -- as fixed pixel counts, they
+    quietly broke once focus-stack alignment started using a much larger
+    proxy (see FOCUS_ECC_PROXY_MAX_DIM): the same 15px/25px kernels are
+    proportionally far smaller against a 2600px proxy, so they failed to
+    merge the subject's separate high-detail regions (body panels, wheel,
+    decal edges, ...) into one connected blob -- confirmed on a real photo,
+    where this fragmented into 18 disconnected pieces with the largest
+    covering under 2% of the frame, silently tripping the degenerate-
+    result fallback below and disabling subject-masking entirely without
+    any error or visible sign that it had stopped doing anything. (In
+    practice this no longer matters much since _align_ecc now always
+    calls this at a fixed, validated scale and upscales the result --
+    kept anyway as a defensive fallback for any other caller.)"""
+    if isinstance(proxies, np.ndarray):
+        proxies = [proxies]
+    h, w = proxies[0].shape[:2]
+    rel = min(h, w) / 1000.0
+    blur_sigma = max(2.0, 6.0 * rel)
+    close_k = max(3, int(round(15 * rel)) | 1)
+    dilate_k = max(3, int(round(25 * rel)) | 1)
+
+    combined = None
+    for proxy in proxies:
+        energy = cv2.Laplacian(proxy, cv2.CV_32F, ksize=5)
+        energy = cv2.GaussianBlur(np.abs(energy), (0, 0), sigmaX=blur_sigma)
+        energy_u8 = cv2.normalize(energy, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        _, frame_mask = cv2.threshold(energy_u8, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        combined = frame_mask if combined is None else cv2.bitwise_or(combined, frame_mask)
+
     # Close small internal gaps (a subject's own low-texture surfaces --
     # e.g. a flat painted panel -- read as "flat" too, same as background),
     # then dilate to pull those surfaces into the mask, before picking the
     # single largest connected blob.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
-    mask = cv2.dilate(mask, np.ones((25, 25), np.uint8))
+    mask = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
+    mask = cv2.dilate(mask, np.ones((dilate_k, dilate_k), np.uint8))
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if num_labels <= 1:
         return None
@@ -374,7 +411,26 @@ def _align_ecc(
     the subject), and switching to a subject-masked fit visibly fixed it.
     """
     ref_proxy, scale = _downsample_gray(images_float[ref_index], proxy_max_dim)
-    mask = _auto_subject_mask(ref_proxy) if use_subject_mask else None
+    mask = None
+    if use_subject_mask:
+        # Detect the subject at the smaller ECC_PROXY_MAX_DIM scale regardless
+        # of proxy_max_dim, then upscale the resulting mask to match ref_proxy
+        # -- _auto_subject_mask's thresholding/morphology is a scale-sensitive
+        # heuristic (confirmed: the exact same subject fragmented into 18
+        # disconnected pieces at 2600px that cleanly formed one blob at
+        # 1000px), so detecting at a fixed, validated scale and resizing the
+        # result is more robust than re-tuning it for every possible
+        # proxy_max_dim. Sample several frames spread across the stack, not
+        # just the reference frame -- whatever part of the subject the
+        # reference frame doesn't happen to have in focus (e.g. a part at a
+        # different depth than whatever the reference was focused on) would
+        # otherwise be invisible to the mask and end up no better aligned
+        # than before subject-masking existed at all.
+        sample_idxs = sorted({round(t * (len(images_float) - 1)) for t in (0.0, 0.25, 0.5, 0.75, 1.0)})
+        mask_proxies = [_downsample_gray(images_float[i], ECC_PROXY_MAX_DIM)[0] for i in sample_idxs]
+        small_mask = _auto_subject_mask(mask_proxies)
+        if small_mask is not None:
+            mask = cv2.resize(small_mask, (ref_proxy.shape[1], ref_proxy.shape[0]), interpolation=cv2.INTER_NEAREST)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
     h, w = images_float[ref_index].shape[:2]
     warp_size = 3 if motion_type == cv2.MOTION_HOMOGRAPHY else 2
