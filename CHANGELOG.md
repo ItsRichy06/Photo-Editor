@@ -18,6 +18,22 @@ git commits.
 
 ## [Unreleased]
 
+## [1.11.4] - 2026-09-17
+### Changed
+- Focus-stack alignment now chains each frame onto its already-aligned
+  neighbor instead of every frame jumping straight to one shared
+  reference frame, so no single alignment step has to bridge more than
+  one frame's worth of focus change however far a frame sits from the
+  reference in the stack. Confirmed no regression on regions that were
+  already sharp. This narrows, but doesn't fully close, one remaining
+  edge case: extreme close-up regions with strong reflected highlights
+  near bright macro lighting can still show some softness, most likely
+  because the highlights themselves shift position between shots (an
+  illumination effect that realignment can't correct) rather than a
+  pure geometry problem -- tried and ruled out two further approaches
+  (per-region local alignment, hard per-pixel frame selection) that
+  didn't hold up under real-world testing.
+
 ## [1.11.3] - 2026-09-17
 ### Fixed
 - Focus-stacked photos could still show real ghosting (not just normal
