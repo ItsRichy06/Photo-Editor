@@ -296,7 +296,41 @@ def _scale_warp(warp: np.ndarray, scale: float) -> np.ndarray:
     return (s @ warp.astype(np.float64) @ np.linalg.inv(s)).astype(np.float32)
 
 
-def _align_ecc(images_float: list, ref_index: int, motion_type) -> list:
+def _auto_subject_mask(ref_proxy: np.ndarray):
+    """Rough single-channel mask (uint8, 0/255) marking the busy/detailed
+    region of a grayscale reference proxy, as opposed to a large plain/
+    low-texture background -- used by _align_ecc's use_subject_mask to
+    keep alignment from being pulled around by a backdrop that dominates
+    the frame's pixel count but isn't the actual subject. Otsu-thresholds
+    a blurred Laplacian-energy map, then keeps only the single largest
+    connected blob, on the assumption that the subject is the largest
+    contiguous textured region in frame -- true for a clean single-subject
+    macro shot, not guaranteed for a busier scene. Returns None (falls
+    back to whole-frame alignment) if the result looks degenerate -- too
+    small a region to align against reliably, or so large it isn't
+    discriminating anything -- rather than risk making alignment worse on
+    a subject/background combination this wasn't validated against."""
+    energy = cv2.Laplacian(ref_proxy, cv2.CV_32F, ksize=5)
+    energy = cv2.GaussianBlur(np.abs(energy), (0, 0), sigmaX=6.0)
+    energy_u8 = cv2.normalize(energy, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, mask = cv2.threshold(energy_u8, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    # Close small internal gaps (a subject's own low-texture surfaces --
+    # e.g. a flat painted panel -- read as "flat" too, same as background),
+    # then dilate to pull those surfaces into the mask, before picking the
+    # single largest connected blob.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    mask = cv2.dilate(mask, np.ones((25, 25), np.uint8))
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return None
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    coverage = stats[largest, cv2.CC_STAT_AREA] / mask.size
+    if coverage < 0.02 or coverage > 0.85:
+        return None
+    return (labels == largest).astype(np.uint8) * 255
+
+
+def _align_ecc(images_float: list, ref_index: int, motion_type, use_subject_mask: bool = False) -> list:
     """Align every image in images_float onto images_float[ref_index] via
     ECC (Enhanced Correlation Coefficient). Used for both HDR and focus
     stacks (with a different motion model -- see callers below): ECC is,
@@ -308,8 +342,21 @@ def _align_ecc(images_float: list, ref_index: int, motion_type) -> list:
     *worse*-aligned result than the unaligned input on this OpenCV build --
     confirmed against a synthetic case with a known exact shift -- so ECC
     is used here instead, verified against the same known-shift case.)
+
+    use_subject_mask restricts what ECC optimizes the fit against to the
+    auto-detected subject region (see _auto_subject_mask) instead of the
+    whole frame -- for a focus stack where the subject has real depth, a
+    whole-frame fit gets pulled toward whatever content dominates the
+    frame's pixel count (often a plain backdrop), which turns out to be a
+    *worse* fit for the subject even though it's a better fit overall.
+    Confirmed against a real 35-frame macro stack: whole-frame alignment
+    left the subject visibly soft/ghosted despite 0.99+ frame correlation
+    (the recovered per-frame scale factor -- consistent with focus
+    breathing -- was measurably different once the fit was restricted to
+    the subject), and switching to a subject-masked fit visibly fixed it.
     """
     ref_proxy, scale = _downsample_gray(images_float[ref_index], ECC_PROXY_MAX_DIM)
+    mask = _auto_subject_mask(ref_proxy) if use_subject_mask else None
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
     h, w = images_float[ref_index].shape[:2]
     warp_size = 3 if motion_type == cv2.MOTION_HOMOGRAPHY else 2
@@ -321,7 +368,17 @@ def _align_ecc(images_float: list, ref_index: int, motion_type) -> list:
         proxy, _ = _downsample_gray(img, ECC_PROXY_MAX_DIM)
         warp = np.eye(warp_size, 3, dtype=np.float32)
         try:
-            _, warp = cv2.findTransformECC(ref_proxy, proxy, warp, motion_type, criteria, None, 5)
+            try:
+                _, warp = cv2.findTransformECC(ref_proxy, proxy, warp, motion_type, criteria, mask, 5)
+            except cv2.error:
+                if mask is None:
+                    raise
+                # The subject mask made this particular frame's fit fail to
+                # converge (e.g. too little subject content visible at its
+                # focus distance) -- retry against the whole frame rather
+                # than giving up and leaving this frame fully unaligned.
+                warp = np.eye(warp_size, 3, dtype=np.float32)
+                _, warp = cv2.findTransformECC(ref_proxy, proxy, warp, motion_type, criteria, None, 5)
             warp = _scale_warp(warp, scale)
             if warp_size == 3:
                 out = cv2.warpPerspective(
@@ -334,7 +391,7 @@ def _align_ecc(images_float: list, ref_index: int, motion_type) -> list:
                     borderMode=cv2.BORDER_REPLICATE,
                 )
         except cv2.error:
-            out = img  # didn't converge -- fall back to the unaligned frame rather than failing the whole stack
+            out = img  # didn't converge either way -- fall back to the unaligned frame rather than failing the whole stack
         aligned.append(out)
     return aligned
 
@@ -349,8 +406,10 @@ def _align_translation(images_float: list, ref_index: int) -> list:
 def _align_homography(images_float: list, ref_index: int) -> list:
     """Full-homography alignment for focus stacks -- focus breathing (a
     lens's field of view subtly changing across its focus range) means a
-    simpler motion model isn't always enough."""
-    return _align_ecc(images_float, ref_index, cv2.MOTION_HOMOGRAPHY)
+    simpler motion model isn't always enough. use_subject_mask=True since
+    it's specifically the subject (not the whole frame) that a focus stack
+    needs to end up sharp -- see _align_ecc's docstring."""
+    return _align_ecc(images_float, ref_index, cv2.MOTION_HOMOGRAPHY, use_subject_mask=True)
 
 
 # ------------------------------------------------------------------ merge
