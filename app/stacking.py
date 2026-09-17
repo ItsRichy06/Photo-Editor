@@ -45,12 +45,18 @@ EV_ROUND = 0.2
 MIN_GROUP_SIZE = 3
 MAX_GROUP_SIZE = 9  # generous upper bound for an HDR bracket, matches real cameras' caps
 # Focus stacks run far longer than exposure brackets ever do (a deep macro
-# stack can legitimately be dozens of frames), so this is much more
+# stack can legitimately run to 50-100+ frames), so this is much more
 # generous -- mainly a backstop against a long same-exposure continuous-
 # shooting burst (sports, wildlife) being swept up as one giant "stack",
 # both for plausibility and because aligning+merging that many full-
-# resolution frames as one group would be very slow.
-MAX_FOCUS_GROUP_SIZE = 30
+# resolution frames as one group would be very slow. Previously 30, which
+# turned out to be low enough to bite a real deliberate 35-frame macro
+# stack -- it got silently chopped into a 30-frame group plus an orphaned
+# 5-frame "stack" of whatever the tail of the sequence happened to be,
+# which looked like a detection bug rather than a hardcoded cap. The
+# per-group review dialog already lets the user reject any candidate that
+# doesn't make sense, so there's little cost to being more generous here.
+MAX_FOCUS_GROUP_SIZE = 100
 
 
 @dataclass
