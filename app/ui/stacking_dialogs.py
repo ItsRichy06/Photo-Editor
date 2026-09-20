@@ -85,7 +85,8 @@ class StackProcessingThread(QThread):
                 merged = stacking.merge_stack(candidate)
                 out_path = stacking.output_path_for(candidate)
                 image_io.save_image(merged, out_path, quality=92)
-                self.catalog.get_or_create_photo(str(out_path))
+                photo = self.catalog.get_or_create_photo(str(out_path))
+                self.catalog.set_source_kind(photo["id"], candidate.kind)
                 self.group_done.emit(candidate, out_path, None)
             except Exception as exc:  # noqa: BLE001 -- keep going past one bad group
                 self.group_done.emit(candidate, None, str(exc))

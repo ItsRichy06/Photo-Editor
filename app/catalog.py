@@ -58,7 +58,17 @@ class Catalog:
             CREATE INDEX IF NOT EXISTS idx_photos_path ON photos(path);
             """
         )
+        # ALTER TABLE ADD COLUMN has no "IF NOT EXISTS" in SQLite, and this
+        # column was added after the table itself, so real existing catalogs
+        # need a real migration rather than just extending the CREATE TABLE
+        # above (which only runs for a brand-new database).
+        self._add_column_if_missing("photos", "source_kind", "TEXT")
         self.conn.commit()
+
+    def _add_column_if_missing(self, table: str, column: str, coltype: str):
+        cols = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
     def get_or_create_photo(self, path: str) -> dict:
         path = str(Path(path).resolve())
@@ -139,6 +149,17 @@ class Catalog:
             raise ValueError(f"invalid flag: {flag}")
         with self._lock:
             self.conn.execute("UPDATE photos SET flag=? WHERE id=?", (flag, photo_id))
+            self.conn.commit()
+
+    def set_source_kind(self, photo_id: int, kind: str | None):
+        """kind: None for a normal photo, "focus" or "hdr" for a photo
+        produced by the Stack Photos feature -- lets the library filter to
+        just the merged outputs instead of every source frame that went
+        into them."""
+        if kind not in (None, "focus", "hdr"):
+            raise ValueError(f"invalid source_kind: {kind}")
+        with self._lock:
+            self.conn.execute("UPDATE photos SET source_kind=? WHERE id=?", (kind, photo_id))
             self.conn.commit()
 
     def get_edit_recipe(self, photo_id: int) -> dict | None:

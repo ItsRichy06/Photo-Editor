@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListView,
     QMessageBox,
     QProgressDialog,
@@ -67,6 +68,7 @@ class PhotoListModel(QAbstractListModel):
     MtimeRole = Qt.ItemDataRole.UserRole + 5
     PhotoIdRole = Qt.ItemDataRole.UserRole + 6
     NameRole = Qt.ItemDataRole.UserRole + 7
+    SourceKindRole = Qt.ItemDataRole.UserRole + 8  # None | "focus" | "hdr" -- see Catalog.set_source_kind
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -102,6 +104,8 @@ class PhotoListModel(QAbstractListModel):
             return item["id"]
         if role == self.NameRole:
             return item["name"]
+        if role == self.SourceKindRole:
+            return item["source_kind"]
         return None
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
@@ -134,6 +138,7 @@ class PhotoListModel(QAbstractListModel):
                     "mtime": photo["mtime"],
                     "is_raw": is_raw,
                     "name": Path(photo["path"]).name,
+                    "source_kind": photo.get("source_kind"),
                 }
             )
             self._id_to_row[photo["id"]] = row
@@ -160,6 +165,8 @@ class PhotoFilterProxy(QSortFilterProxyModel):
         super().__init__(parent)
         self.min_rating = 0
         self.type_filter = "all"
+        self.kind_filter = "all"  # "all" | "focus" | "hdr" | "originals"
+        self.search_text = ""
         self.sort_mode = "name"
         self.setDynamicSortFilter(True)
 
@@ -169,6 +176,14 @@ class PhotoFilterProxy(QSortFilterProxyModel):
 
     def set_type_filter(self, type_filter: str):
         self.type_filter = type_filter
+        self.invalidateFilter()
+
+    def set_kind_filter(self, kind_filter: str):
+        self.kind_filter = kind_filter
+        self.invalidateFilter()
+
+    def set_search_text(self, text: str):
+        self.search_text = text.strip().lower()
         self.invalidateFilter()
 
     def set_sort_mode(self, mode: str):
@@ -187,6 +202,16 @@ class PhotoFilterProxy(QSortFilterProxyModel):
             if self.type_filter == "jpeg" and is_raw:
                 return False
             if self.type_filter == "raw" and not is_raw:
+                return False
+        if self.kind_filter != "all":
+            kind = index.data(PhotoListModel.SourceKindRole)
+            if self.kind_filter == "originals" and kind is not None:
+                return False
+            if self.kind_filter in ("focus", "hdr") and kind != self.kind_filter:
+                return False
+        if self.search_text:
+            name = (index.data(PhotoListModel.NameRole) or "").lower()
+            if self.search_text not in name:
                 return False
         return True
 
@@ -413,11 +438,33 @@ class LibraryView(QWidget):
         self.stack_btn.clicked.connect(self._on_stack_photos)
         toolbar.addWidget(self.stack_btn)
 
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Search filename…")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setMaximumWidth(200)
+        # Debounced rather than filtering on every keystroke -- re-evaluating
+        # the filter is cheap per keystroke individually, but typing a whole
+        # word into a library of thousands of photos would otherwise re-run
+        # it once per character for no benefit over running it once when
+        # typing pauses.
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(lambda: self.proxy.set_search_text(self.search_box.text()))
+        self.search_box.textChanged.connect(lambda _: self._search_timer.start())
+        toolbar.addWidget(self.search_box)
+
         toolbar.addWidget(QLabel("Show:"))
         self.type_filter = QComboBox()
         self.type_filter.addItems(["All formats", "JPEG only", "RAW only"])
         self.type_filter.currentIndexChanged.connect(self._on_type_filter_changed)
         toolbar.addWidget(self.type_filter)
+
+        self.kind_filter = QComboBox()
+        self.kind_filter.addItems(["All photos", "Originals only", "Focus stacks", "HDR merges"])
+        self.kind_filter.setToolTip("Filter to just the merged outputs from Stack Photos, or hide them.")
+        self.kind_filter.currentIndexChanged.connect(self._on_kind_filter_changed)
+        toolbar.addWidget(self.kind_filter)
 
         toolbar.addWidget(QLabel("Min rating:"))
         self.rating_filter = QComboBox()
@@ -703,6 +750,9 @@ class LibraryView(QWidget):
 
     def _on_type_filter_changed(self, idx: int):
         self.proxy.set_type_filter({0: "all", 1: "jpeg", 2: "raw"}.get(idx, "all"))
+
+    def _on_kind_filter_changed(self, idx: int):
+        self.proxy.set_kind_filter({0: "all", 1: "originals", 2: "focus", 3: "hdr"}.get(idx, "all"))
 
     def _on_sort_changed(self, idx: int):
         self.proxy.set_sort_mode({0: "name", 1: "date", 2: "rating"}.get(idx, "name"))
