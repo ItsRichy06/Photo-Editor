@@ -18,6 +18,15 @@ git commits.
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-09-20
+### Added
+- Search box in the library: filters the grid to filenames containing
+  the typed text as you type.
+- A "Show:" filter for Focus stacks / HDR merges / Originals only, so a
+  merged output from Stack Photos can be found on its own or hidden
+  from the regular browsing view instead of mixing in with its source
+  frames.
+
 ## [1.11.5] - 2026-09-17
 ### Added
 - The library now recognizes .tif/.tiff files, so a photo exported from
