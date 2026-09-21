@@ -18,6 +18,20 @@ git commits.
 
 ## [Unreleased]
 
+## [1.13.2] - 2026-09-21
+### Fixed
+- The catalog could fail with "database disk image is malformed" on an
+  ordinary write, even though the underlying database file was
+  genuinely fine (confirmed with PRAGMA integrity_check both before and
+  after) -- this was WAL-mode shared-memory-index corruption, not
+  actual data corruption, and only ever showed up from a real
+  interactive launch (most likely antivirus real-time scanning
+  interfering with SQLite's memory-mapped index file at the wrong
+  moment). The catalog now detects this specific error and
+  automatically recovers -- clearing and regenerating the affected
+  sidecar files and retrying once -- instead of leaving the library
+  stuck.
+
 ## [1.13.1] - 2026-09-21
 ### Fixed
 - The library could get stuck showing "Scanning..." forever, with no
