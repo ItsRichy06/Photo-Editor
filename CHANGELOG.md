@@ -18,6 +18,27 @@ git commits.
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-09-21
+### Added
+- "Delete Selected..." in the library: select 1+ photos, confirm once,
+  and the files go to the Recycle Bin (not a permanent delete --
+  recoverable there, same as deleting in Explorer), with their catalog
+  rating/flag/edit history cleaned up alongside.
+### Changed
+- The library's rating filter now shows an exact star count instead of
+  "N or more" -- selecting "2" isolates just the photos still sitting
+  at 2 stars, instead of also showing every 3/4/5-star photo mixed in.
+### Fixed
+- Auto-Rate Unrated could completely miss real overexposure (a flash
+  photo with blown-out faces/clothing scored 4-5 stars) because the
+  clipping check required near-literal pure white, which a downsampled
+  thumbnail almost never actually contains even when the full-size
+  photo clearly is blown out. Recalibrated the clipping detection
+  (and, since the fix uncovered it, gave shadows and highlights
+  separate thresholds -- they have very different natural rates, and
+  sharing one threshold was making 67% of ordinary photos look
+  falsely bad on a test sample before this was caught and fixed).
+
 ## [1.13.2] - 2026-09-21
 ### Fixed
 - The catalog could fail with "database disk image is malformed" on an
