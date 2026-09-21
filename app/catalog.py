@@ -26,7 +26,16 @@ class Catalog:
 
     def __init__(self, db_path: str | None = None):
         self.db_path = Path(db_path) if db_path else (app_data_dir() / DEFAULT_DB_NAME)
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        # timeout=30: how long a write waits for another connection's lock to
+        # clear before raising "database is locked", instead of Python's
+        # sqlite3 default of 5s -- found too short the hard way: a second
+        # short-lived process (e.g. a diagnostic script) briefly writing to
+        # this same file was enough to make a folder scan's own write throw,
+        # which (see ThumbnailLoaderThread.run()'s matching fix) used to kill
+        # the whole scan silently, leaving the library stuck on "Scanning..."
+        # forever with no error shown and no way to recover short of
+        # restarting the app.
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
         # WAL + NORMAL sync: commits no longer force a full fsync-per-row, which
         # is what made scanning a folder of thousands of photos crawl.

@@ -329,6 +329,7 @@ class ThumbnailLoaderThread(QThread):
     scan_registered = Signal(list)  # list of (photo_dict, is_raw), emitted once
     photo_ready = Signal(int, object)  # photo_id, PIL.Image
     finished_scanning = Signal(int)
+    scan_failed = Signal(str)  # error message
 
     def __init__(self, folder, catalog, recursive: bool = True, thumb_size: int = THUMB_SIZE, max_workers=None):
         super().__init__()
@@ -386,12 +387,24 @@ class ThumbnailLoaderThread(QThread):
                 self._done_count += 1
 
     def run(self):
-        paths = list(image_io.scan_folder(self.folder, self.recursive))
-        if not paths or self._stop:
-            self.finished_scanning.emit(0)
+        # Scanning the folder and registering everything in the catalog used
+        # to be unguarded -- any failure here (e.g. a transient "database is
+        # locked" from another process briefly writing to the same
+        # catalog.db, confirmed as a real way to trigger this) silently
+        # killed the thread before it ever emitted scan_registered, leaving
+        # the library stuck showing "Scanning..." forever with no error and
+        # no way to recover short of restarting the app. Now it reports the
+        # failure instead of just disappearing.
+        try:
+            paths = list(image_io.scan_folder(self.folder, self.recursive))
+            if not paths or self._stop:
+                self.finished_scanning.emit(0)
+                return
+            photos_by_path = self.catalog.get_or_create_photos_bulk([str(p) for p in paths])
+        except Exception as exc:  # noqa: BLE001 - see comment above
+            print(f"[library] folder scan failed: {exc}")
+            self.scan_failed.emit(str(exc))
             return
-
-        photos_by_path = self.catalog.get_or_create_photos_bulk([str(p) for p in paths])
 
         registered = []
         path_by_id = {}
@@ -669,7 +682,7 @@ class LibraryView(QWidget):
         doesn't garbage-collect the wrapper while the QThread is still alive.
         """
         thread.stop()
-        for sig in (thread.scan_registered, thread.photo_ready, thread.finished_scanning):
+        for sig in (thread.scan_registered, thread.photo_ready, thread.finished_scanning, thread.scan_failed):
             try:
                 sig.disconnect()
             except (RuntimeError, TypeError):
@@ -690,6 +703,7 @@ class LibraryView(QWidget):
         self.loader_thread.scan_registered.connect(self._on_scan_registered)
         self.loader_thread.photo_ready.connect(self._on_photo_ready)
         self.loader_thread.finished_scanning.connect(self._on_scan_finished)
+        self.loader_thread.scan_failed.connect(self._on_scan_failed)
         self.loader_thread.start()
 
     def _on_scan_registered(self, registered: list):
@@ -737,6 +751,16 @@ class LibraryView(QWidget):
 
     def _on_scan_finished(self, count: int):
         self.status_label.setText(f"{count} photos")
+
+    def _on_scan_failed(self, error: str):
+        self.status_label.setText("Scan failed -- click Open Folder to retry")
+        QMessageBox.warning(
+            self,
+            "Scan Failed",
+            f"Couldn't finish scanning this folder:\n\n{error}\n\n"
+            "This is usually transient (e.g. another process briefly using the photo catalog). "
+            "Try Open Folder again -- your ratings and edits are untouched either way.",
+        )
 
     # ---------------------------------------------------------- stacking
 
