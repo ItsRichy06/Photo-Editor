@@ -39,10 +39,34 @@ SHARPNESS_SOFT = 200.0  # below this: noticeably soft, might not hold up at full
 SHARPNESS_DECENT = 800.0  # below this: acceptably sharp for typical viewing
 SHARPNESS_SHARP = 2500.0  # at/above this: crisp
 
-# Clipping thresholds, as % of pixels within 1/255 of pure black or white.
-CLIP_MODERATE = 15.0
-CLIP_MILD = 5.0
-CLIP_SLIGHT = 1.0
+# Per-pixel luminance beyond which a pixel counts as "near-black"/"near-
+# white" for clipping purposes -- deliberately NOT close to literal 0/1.
+# Resizing down to thumbnail resolution (see thumbnails.THUMB_SIZE) blends
+# truly-clipped pixels with their neighbors, pulling a genuinely blown-out
+# region (0.99+ at full resolution) down into roughly the 0.85-0.95 range
+# by the time it's a 320px thumbnail -- checking for literal near-0/near-1
+# on a *resized* image just never fires. Confirmed live: a real flash-
+# blown photo (faces/jackets visibly pure white) measured 0% pixels above
+# 254/255 but 31.57% above this threshold.
+CLIP_PIXEL_THRESHOLD = 0.85
+
+# Tier percentages -- separate for highlights and shadows, NOT shared.
+# Confirmed live that sharing one set was a real bug: dark tones (shadows,
+# hair, dark clothing, depth) are just normal in most photography, so
+# "% of pixels below the shadow threshold" runs vastly higher than "% above
+# the highlight threshold" even in completely ordinary photos -- a 150-photo
+# sample of this library measured median shadow%=27.9 vs median
+# highlight%=0.5, and using the same cutoff for both meant 67% of NORMAL
+# photos tripped the shadow side alone. Each set below is calibrated
+# against that same sample's own distribution (only the tail should ever
+# trigger MODERATE, not the majority).
+CLIP_HIGHLIGHT_MODERATE = 15.0  # highlight% distribution: p90=6.2 p95=10.5 max=17.7
+CLIP_HIGHLIGHT_MILD = 6.0
+CLIP_HIGHLIGHT_SLIGHT = 2.0
+
+CLIP_SHADOW_MODERATE = 85.0  # shadow% distribution: median=27.9 p75=45.4 p90=70.1 p95=83.7
+CLIP_SHADOW_MILD = 70.0
+CLIP_SHADOW_SLIGHT = 45.0
 
 
 def _to_float01(img: Image.Image) -> np.ndarray:
@@ -86,11 +110,12 @@ def compute_sharpness(image_float: np.ndarray) -> float:
 
 
 def compute_clipping(image_float: np.ndarray) -> tuple[float, float]:
-    """Returns (shadow_clip_pct, highlight_clip_pct)."""
+    """Returns (shadow_clip_pct, highlight_clip_pct) -- % of pixels beyond
+    CLIP_PIXEL_THRESHOLD from black/white respectively."""
     img = np.clip(image_float, 0.0, 1.0)
     luminance = 0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
-    shadow_pct = float((luminance < (1.0 / 255.0)).mean() * 100.0)
-    highlight_pct = float((luminance > (254.0 / 255.0)).mean() * 100.0)
+    shadow_pct = float((luminance < (1.0 - CLIP_PIXEL_THRESHOLD)).mean() * 100.0)
+    highlight_pct = float((luminance > CLIP_PIXEL_THRESHOLD).mean() * 100.0)
     return shadow_pct, highlight_pct
 
 
@@ -106,7 +131,7 @@ def _sharpness_tier(sharpness: float) -> int:
     return 5
 
 
-def _exposure_tier(clip_pct: float) -> int:
+def _clip_tier(clip_pct: float, moderate: float, mild: float, slight: float) -> int:
     """Floors at 2 ("possibly recoverable"), never 1 ("useless") -- unlike
     blur, clipped shadows/highlights in a RAW file are usually recoverable
     with the Shadows/Blacks/Highlights sliders already in this app, and
@@ -114,13 +139,19 @@ def _exposure_tier(clip_pct: float) -> int:
     night shot or a silhouette can legitimately have most of the frame
     near-black. Reserve "useless" for the one thing editing can never fix:
     a genuine focus miss."""
-    if clip_pct >= CLIP_MODERATE:  # includes CLIP_SEVERE -- both floor at 2, see docstring
+    if clip_pct >= moderate:
         return 2
-    if clip_pct >= CLIP_MILD:
+    if clip_pct >= mild:
         return 3
-    if clip_pct >= CLIP_SLIGHT:
+    if clip_pct >= slight:
         return 4
     return 5
+
+
+def _exposure_tier(shadow_pct: float, highlight_pct: float) -> int:
+    shadow_tier = _clip_tier(shadow_pct, CLIP_SHADOW_MODERATE, CLIP_SHADOW_MILD, CLIP_SHADOW_SLIGHT)
+    highlight_tier = _clip_tier(highlight_pct, CLIP_HIGHLIGHT_MODERATE, CLIP_HIGHLIGHT_MILD, CLIP_HIGHLIGHT_SLIGHT)
+    return min(shadow_tier, highlight_tier)
 
 
 def _get_shutter_seconds(path_str: str):
@@ -141,7 +172,7 @@ def assess_quality(image_float: np.ndarray, shutter_seconds) -> int:
     exposure) caps the result -- a photo ruined by either alone shouldn't
     score well just because the other axis is fine."""
     shadow_pct, highlight_pct = compute_clipping(image_float)
-    exposure_tier = _exposure_tier(max(shadow_pct, highlight_pct))
+    exposure_tier = _exposure_tier(shadow_pct, highlight_pct)
 
     is_long_exposure = shutter_seconds is not None and shutter_seconds >= LONG_EXPOSURE_THRESHOLD
     if is_long_exposure:
