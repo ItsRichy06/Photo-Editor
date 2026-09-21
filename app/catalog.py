@@ -222,6 +222,19 @@ class Catalog:
             self.conn.execute("UPDATE photos SET flag=? WHERE id=?", (flag, photo_id))
             self.conn.commit()
 
+    def delete_photos(self, photo_ids: list[int]):
+        """Removes these photos' rows (and their edit recipes) from the
+        catalog. Does not touch the actual files -- see LibraryView's
+        delete flow, which sends the real files to the Recycle Bin
+        separately and only calls this after that succeeds."""
+        if not photo_ids:
+            return
+        with self._lock:
+            placeholders = ",".join("?" for _ in photo_ids)
+            self.conn.execute(f"DELETE FROM edits WHERE photo_id IN ({placeholders})", photo_ids)
+            self.conn.execute(f"DELETE FROM photos WHERE id IN ({placeholders})", photo_ids)
+            self.conn.commit()
+
     def set_source_kind(self, photo_id: int, kind: str | None):
         """kind: None for a normal photo, "focus" or "hdr" for a photo
         produced by the Stack Photos feature -- lets the library filter to

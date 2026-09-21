@@ -14,6 +14,8 @@ import queue
 import threading
 from pathlib import Path
 
+import send2trash
+
 from PySide6.QtCore import (
     QAbstractListModel,
     QEvent,
@@ -184,15 +186,18 @@ class PhotoListModel(QAbstractListModel):
 class PhotoFilterProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.min_rating = 0
+        self.rating_filter = 0  # 0 = no filter, else an exact 1-5 star match
         self.type_filter = "all"
         self.kind_filter = "all"  # "all" | "focus" | "hdr" | "originals"
         self.search_text = ""
         self.sort_mode = "name"
         self.setDynamicSortFilter(True)
 
-    def set_min_rating(self, rating: int):
-        self.min_rating = rating
+    def set_rating_filter(self, rating: int):
+        """rating: 0 shows everything; 1-5 shows only photos with exactly
+        that many stars (not "at least" -- exact, so you can isolate e.g.
+        just the 2-stars still waiting on a second look)."""
+        self.rating_filter = rating
         self.invalidateFilter()
 
     def set_type_filter(self, type_filter: str):
@@ -214,9 +219,9 @@ class PhotoFilterProxy(QSortFilterProxyModel):
 
     def filterAcceptsRow(self, source_row, source_parent):
         index = self.sourceModel().index(source_row, 0, source_parent)
-        if self.min_rating > 0:
+        if self.rating_filter > 0:
             rating = index.data(PhotoListModel.RatingRole) or 0
-            if rating < self.min_rating:
+            if rating != self.rating_filter:
                 return False
         if self.type_filter != "all":
             is_raw = bool(index.data(PhotoListModel.IsRawRole))
@@ -539,6 +544,15 @@ class LibraryView(QWidget):
         self.auto_rate_btn.clicked.connect(self._on_auto_rate_clicked)
         toolbar.addWidget(self.auto_rate_btn)
 
+        self.delete_btn = QPushButton("Delete Selected…")
+        self.delete_btn.setToolTip(
+            "Select 1+ photos (Ctrl/Shift-click), then remove them from the library and send "
+            "the actual files to the Recycle Bin -- not a permanent delete, still recoverable "
+            "there afterward."
+        )
+        self.delete_btn.clicked.connect(self._on_delete_selected)
+        toolbar.addWidget(self.delete_btn)
+
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search filename…")
         self.search_box.setClearButtonEnabled(True)
@@ -567,10 +581,11 @@ class LibraryView(QWidget):
         self.kind_filter.currentIndexChanged.connect(self._on_kind_filter_changed)
         toolbar.addWidget(self.kind_filter)
 
-        toolbar.addWidget(QLabel("Min rating:"))
+        toolbar.addWidget(QLabel("Rating:"))
         self.rating_filter = QComboBox()
-        self.rating_filter.addItems(["All", "1+", "2+", "3+", "4+", "5"])
-        self.rating_filter.currentIndexChanged.connect(lambda i: self.proxy.set_min_rating(i))
+        self.rating_filter.addItems(["All", "1", "2", "3", "4", "5"])
+        self.rating_filter.setToolTip("Show only photos with exactly this many stars.")
+        self.rating_filter.currentIndexChanged.connect(lambda i: self.proxy.set_rating_filter(i))
         toolbar.addWidget(self.rating_filter)
 
         toolbar.addWidget(QLabel("Sort:"))
@@ -762,11 +777,58 @@ class LibraryView(QWidget):
             "Try Open Folder again -- your ratings and edits are untouched either way.",
         )
 
+    # ----------------------------------------------------------- deleting
+
+    def _on_delete_selected(self):
+        photos = self._selected_photos()
+        if not photos:
+            QMessageBox.information(self, "Delete Selected", "Select 1+ photos to delete (Ctrl/Shift-click).")
+            return
+
+        choice = QMessageBox.question(
+            self,
+            "Delete Selected Photos",
+            f"Remove {len(photos)} photo{'s' if len(photos) != 1 else ''} from the library and send "
+            f"the file{'s' if len(photos) != 1 else ''} to the Recycle Bin?\n\n"
+            "This is not a permanent delete -- the file(s) can still be restored from the Recycle "
+            "Bin afterward, the same as deleting them in Explorer. Their rating, flag, and edit "
+            "history in this app's catalog will be removed either way.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted_ids = []
+        failed = []
+        for photo in photos:
+            try:
+                send2trash.send2trash(photo["path"])
+                deleted_ids.append(photo["id"])
+            except Exception as exc:  # noqa: BLE001 - keep going past a locked/missing file
+                failed.append((photo["path"], str(exc)))
+
+        if deleted_ids:
+            self.catalog.delete_photos(deleted_ids)
+
+        message = f"Deleted {len(deleted_ids)} photo{'s' if len(deleted_ids) != 1 else ''}."
+        if failed:
+            message += f"\n\n{len(failed)} failed:\n" + "\n".join(f"  {Path(p).name}: {err}" for p, err in failed[:8])
+        QMessageBox.information(self, "Delete Selected", message)
+
+        if deleted_ids and self.current_folder:
+            self.load_folder(self.current_folder)  # picks up the removal, non-blocking (see _retire_loader_thread)
+
     # ---------------------------------------------------------- stacking
 
     def _selected_paths(self) -> list:
         indexes = self.list_view.selectionModel().selectedIndexes()
         return [Path(idx.data(PhotoListModel.PathRole)) for idx in indexes]
+
+    def _selected_photos(self) -> list:
+        """[{"id", "path"}, ...] for the current selection."""
+        indexes = self.list_view.selectionModel().selectedIndexes()
+        return [{"id": idx.data(PhotoListModel.PhotoIdRole), "path": idx.data(PhotoListModel.PathRole)} for idx in indexes]
 
     def _on_stack_photos(self):
         paths = self._selected_paths()

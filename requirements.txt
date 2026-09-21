@@ -8,6 +8,7 @@ shiboken6>=6.7
 rawpy>=0.23.2
 Pillow>=10.3
 opencv-python>=4.10
+send2trash>=1.8  # library "Delete Selected" moves files to the Recycle Bin, never a permanent os.remove()
 numpy>=1.26
 
 # AI object selection (Phase 3). torch/torchvision must come from PyTorch's
