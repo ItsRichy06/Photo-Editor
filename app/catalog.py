@@ -26,6 +26,18 @@ class Catalog:
 
     def __init__(self, db_path: str | None = None):
         self.db_path = Path(db_path) if db_path else (app_data_dir() / DEFAULT_DB_NAME)
+        self._lock = threading.RLock()
+        try:
+            self._connect()
+            self._init_schema()
+        except Exception as exc:
+            if not self._is_malformed_error(exc):
+                raise
+            print(f"[catalog] 'database disk image is malformed' at startup -- recovering and retrying: {exc}")
+            self._recover_from_malformed()
+            self._init_schema()
+
+    def _connect(self):
         # timeout=30: how long a write waits for another connection's lock to
         # clear before raising "database is locked", instead of Python's
         # sqlite3 default of 5s -- found too short the hard way: a second
@@ -41,8 +53,40 @@ class Catalog:
         # is what made scanning a folder of thousands of photos crawl.
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        self._lock = threading.RLock()
-        self._init_schema()
+
+    def _recover_from_malformed(self):
+        """Close, clear the WAL-mode sidecar files (-wal/-shm), and reconnect.
+
+        Confirmed live, repeatedly, on a real installed copy: "database disk
+        image is malformed" during an ordinary write, even though
+        PRAGMA integrity_check on the same file moments before and after
+        always reports "ok" -- this is WAL-mode shared-memory-index
+        corruption, not actual page-data corruption (never reproduced from
+        any scripted launch, only real interactive ones, which points at
+        something like antivirus real-time scanning interfering with
+        SQLite's memory-mapped -shm file, though the exact trigger was never
+        pinned down). The -wal file only ever holds not-yet-checkpointed
+        writes; on a sync=NORMAL/WAL setup those are the most recent
+        uncommitted ones, so this can lose a just-in-flight write, but the
+        alternative -- the catalog silently refusing to open at all for the
+        rest of the session, exactly what this replaced -- is worse. Deleting
+        and letting SQLite regenerate both fresh has reliably recovered every
+        single time this was hit and fixed by hand before this method
+        existed.
+        """
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        for suffix in ("-wal", "-shm"):
+            try:
+                Path(str(self.db_path) + suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._connect()
+
+    def _is_malformed_error(self, exc: Exception) -> bool:
+        return isinstance(exc, sqlite3.DatabaseError) and "malformed" in str(exc).lower()
 
     def _init_schema(self):
         self.conn.executescript(
@@ -102,7 +146,22 @@ class Catalog:
         Used by the folder scan instead of get_or_create_photo() in a loop --
         committing once per file (with fsync) for thousands of photos is the
         main reason a big library scan used to crawl.
+
+        Retries once, recovering via _recover_from_malformed(), if this hits
+        "database disk image is malformed" -- confirmed live as this exact
+        call's failure mode; see _recover_from_malformed()'s docstring.
         """
+        try:
+            return self._get_or_create_photos_bulk_once(paths)
+        except Exception as exc:
+            if not self._is_malformed_error(exc):
+                raise
+            print(f"[catalog] 'database disk image is malformed' during folder scan -- recovering and retrying: {exc}")
+            with self._lock:
+                self._recover_from_malformed()
+            return self._get_or_create_photos_bulk_once(paths)
+
+    def _get_or_create_photos_bulk_once(self, paths: list[str]) -> dict:
         resolved = [str(Path(p).resolve()) for p in paths]
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         result = {}
@@ -121,7 +180,10 @@ class Catalog:
                     )
                 self.conn.commit()
             except Exception:
-                self.conn.rollback()
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass  # connection itself may be broken (e.g. the malformed-db case) -- let the caller's retry handle it
                 raise
 
             chunk_size = 500
