@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import image_io, thumbnails
+from .. import image_io, quality, thumbnails
 from ..settings import LAST_LIBRARY_FOLDER, get_settings
 from . import stacking_dialogs, widgets
 
@@ -151,6 +151,27 @@ class PhotoListModel(QAbstractListModel):
         self._thumbnails[photo_id] = pixmap
         idx = self.index(row)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
+
+    def set_rating_by_id(self, photo_id, rating: int):
+        """Like setData(..., RatingRole) but addressed by photo id -- for
+        callers (e.g. a background auto-rate pass) that only have the id,
+        not a QModelIndex into the current (possibly filtered/sorted) view."""
+        row = self._id_to_row.get(photo_id)
+        if row is None:
+            return
+        self._items[row]["rating"] = rating
+        idx = self.index(row)
+        self.dataChanged.emit(idx, idx, [self.RatingRole])
+
+    def unrated_photos(self) -> list:
+        """[{"id", "path", "is_raw"}, ...] for every photo with no rating yet
+        -- what a bulk auto-rate pass should consider, so it never touches a
+        photo the user already rated by hand."""
+        return [
+            {"id": item["id"], "path": item["path"], "is_raw": item["is_raw"]}
+            for item in self._items
+            if not item["rating"]
+        ]
 
     def clear(self):
         self.beginResetModel()
@@ -400,6 +421,62 @@ class ThumbnailLoaderThread(QThread):
         self.finished_scanning.emit(self._done_count)
 
 
+class AutoRateThread(QThread):
+    """Bulk classical (non-AI) technical-quality pass over every unrated
+    photo in the library -- see app/quality.py for the actual sharpness/
+    exposure scoring. Runs off the UI thread even though each photo is fast
+    (sub-millisecond once its thumbnail is cached), since a library-wide
+    pass over thousands of photos still adds up to real wall-clock time and
+    the UI would otherwise freeze for the whole thing.
+
+    When both a RAW and a JPEG exist for the same shot (same filename stem
+    -- this app's own convention, also relied on by stacking.dedupe_pairs),
+    only the RAW gets decoded and scored, and the result is applied to both
+    catalog entries. On a library that's ~99% RAW+JPEG pairs, that halves
+    the actual decode work."""
+
+    progress = Signal(int, int)  # groups done, groups total
+    photo_rated = Signal(int, int)  # photo_id, rating
+    finished_rating = Signal(int)  # total photo ids rated (both pair members counted)
+
+    def __init__(self, unrated_photos: list, catalog):
+        super().__init__()
+        self.unrated_photos = unrated_photos
+        self.catalog = catalog
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        groups = {}  # stem -> list of {"id", "path", "is_raw"}
+        for photo in self.unrated_photos:
+            groups.setdefault(Path(photo["path"]).stem, []).append(photo)
+
+        total = len(groups)
+        done = 0
+        rated_count = 0
+        for members in groups.values():
+            if self._stop:
+                break
+            representative = next((m for m in members if m["is_raw"]), members[0])
+            try:
+                rating = quality.assess_photo(representative["path"])
+            except Exception as exc:  # noqa: BLE001 - keep going past a bad file
+                print(f"[auto-rate] failed to assess {representative['path']}: {exc}")
+                done += 1
+                self.progress.emit(done, total)
+                continue
+            for member in members:
+                self.catalog.set_rating(member["id"], rating)
+                self.photo_rated.emit(member["id"], rating)
+                rated_count += 1
+            done += 1
+            self.progress.emit(done, total)
+
+        self.finished_rating.emit(rated_count)
+
+
 class LibraryView(QWidget):
     openPhotoRequested = Signal(int, str)
 
@@ -418,6 +495,8 @@ class LibraryView(QWidget):
         self._stack_analysis_thread = None
         self._stack_process_thread = None
         self._stack_results = []
+        self._auto_rate_thread = None
+        self._auto_rate_progress = None
 
         self.model = PhotoListModel(self)
         self.proxy = PhotoFilterProxy(self)
@@ -437,6 +516,15 @@ class LibraryView(QWidget):
         )
         self.stack_btn.clicked.connect(self._on_stack_photos)
         toolbar.addWidget(self.stack_btn)
+
+        self.auto_rate_btn = QPushButton("Auto-Rate Unrated…")
+        self.auto_rate_btn.setToolTip(
+            "Give every photo with no star rating yet a rough 1-5 rating from automatic "
+            "sharpness/exposure detection (long exposures are exempted from the sharpness "
+            "check). Never touches a photo you've already rated by hand."
+        )
+        self.auto_rate_btn.clicked.connect(self._on_auto_rate_clicked)
+        toolbar.addWidget(self.auto_rate_btn)
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search filename…")
@@ -737,6 +825,59 @@ class LibraryView(QWidget):
 
         if succeeded and self.current_folder:
             self.load_folder(self.current_folder)  # picks up the new files, non-blocking (see _retire_loader_thread)
+
+    # -------------------------------------------------------- auto-rating
+
+    def _on_auto_rate_clicked(self):
+        unrated = self.model.unrated_photos()
+        if not unrated:
+            QMessageBox.information(self, "Auto-Rate Unrated", "Every photo in this folder already has a rating.")
+            return
+
+        choice = QMessageBox.question(
+            self,
+            "Auto-Rate Unrated Photos",
+            f"Give {len(unrated)} unrated photo{'s' if len(unrated) != 1 else ''} a rough 1-5 star rating based "
+            "on automatic sharpness and exposure detection?\n\n"
+            "This only ever fills in photos with no rating yet -- it never changes a rating "
+            "you've set by hand. You can always re-rate anything afterward.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+
+        stems = {Path(p["path"]).stem for p in unrated}
+        self._auto_rate_progress = QProgressDialog("Rating photos…", "Cancel", 0, len(stems), self)
+        self._auto_rate_progress.setWindowTitle("Auto-Rate Unrated")
+        self._auto_rate_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._auto_rate_progress.setMinimumDuration(0)
+        self._auto_rate_progress.setValue(0)
+
+        self._auto_rate_thread = AutoRateThread(unrated, self.catalog)
+        self._auto_rate_thread.progress.connect(self._on_auto_rate_progress)
+        self._auto_rate_thread.photo_rated.connect(self._on_photo_rated)
+        self._auto_rate_thread.finished_rating.connect(self._on_auto_rate_finished)
+        self._auto_rate_progress.canceled.connect(self._auto_rate_thread.stop)
+        self._auto_rate_thread.start()
+
+    def _on_auto_rate_progress(self, done: int, total: int):
+        if self._auto_rate_progress is not None:
+            self._auto_rate_progress.setValue(done)
+
+    def _on_photo_rated(self, photo_id: int, rating: int):
+        self.model.set_rating_by_id(photo_id, rating)
+
+    def _on_auto_rate_finished(self, rated_count: int):
+        if self._auto_rate_progress is not None:
+            self._auto_rate_progress.close()
+            self._auto_rate_progress = None
+        QMessageBox.information(
+            self,
+            "Auto-Rate Unrated",
+            f"Rated {rated_count} photo{'s' if rated_count != 1 else ''}. These are rough, automatic "
+            "ratings -- review and adjust any that look off.",
+        )
 
     def _on_double_clicked(self, index):
         if not index.isValid():
