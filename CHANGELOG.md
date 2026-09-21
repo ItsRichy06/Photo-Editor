@@ -18,6 +18,25 @@ git commits.
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-09-21
+### Added
+- "Auto-Rate Unrated..." in the library: gives every photo with no star
+  rating yet a rough 1-5 rating from automatic sharpness and exposure
+  detection, so a large unrated backlog can get a fast first pass instead
+  of rating thousands of photos by hand. Sharpness is computed per-tile
+  and takes the sharpest region of the frame rather than a whole-frame
+  average, so a shallow-depth-of-field shot (a sharp subject against a
+  deliberately blurred background) isn't misjudged as blurry; long
+  exposures (1s or slower) are exempted from the sharpness check
+  entirely, since their motion blur is usually intentional. Exposure
+  problems alone never rate below 2 ("possibly recoverable") -- clipping
+  is usually fixable with this app's own Shadows/Blacks/Highlights
+  sliders and isn't necessarily a mistake (a deliberate low-key or night
+  shot can legitimately be mostly near-black); only a genuine focus miss,
+  which editing can't fix, can earn the bottom rating. When both a RAW
+  and a JPEG exist for the same shot, only one gets analyzed and the
+  result applies to both. Never touches a photo already rated by hand.
+
 ## [1.12.0] - 2026-09-20
 ### Added
 - Search box in the library: filters the grid to filenames containing
