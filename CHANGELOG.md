@@ -18,6 +18,16 @@ git commits.
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-09-21
+### Fixed
+- The library could get stuck showing "Scanning..." forever, with no
+  thumbnails and no error, if registering the scanned photos in the
+  catalog hit any failure (confirmed cause: a transient "database is
+  locked" when a second short-lived process briefly wrote to the same
+  catalog.db). Raised the database's lock-wait timeout from 5s to 30s,
+  and any failure that still occurs now shows "Scan failed -- click
+  Open Folder to retry" plus a dialog instead of hanging silently.
+
 ## [1.13.0] - 2026-09-21
 ### Added
 - "Auto-Rate Unrated..." in the library: gives every photo with no star
