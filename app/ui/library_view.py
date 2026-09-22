@@ -632,9 +632,26 @@ class LibraryView(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._install_shortcuts()
 
+        # Deferred (not called directly here) so the window can actually
+        # show/paint first instead of the whole app appearing to hang while
+        # this folder scan runs. Guarded by _auto_load_pending: confirmed
+        # live as a real bug that this singleShot(0) can still be sitting in
+        # the event queue by the time the user manually opens a different
+        # folder (e.g. clicking Open Folder right at startup) -- without the
+        # guard, this callback still fires afterward and silently reverts
+        # back to the old folder, discarding the folder the user actually
+        # picked. load_folder() clears the flag as soon as ANYTHING (this
+        # auto-load included) actually starts a scan, so whichever happens
+        # first wins and nothing queued after it can clobber that choice.
+        self._auto_load_pending = False
         last_folder = self.settings.value(LAST_LIBRARY_FOLDER, "")
         if last_folder and Path(last_folder).is_dir():
-            QTimer.singleShot(0, lambda: self.load_folder(last_folder))
+            self._auto_load_pending = True
+            QTimer.singleShot(0, lambda: self._auto_load_last_folder(last_folder))
+
+    def _auto_load_last_folder(self, folder: str):
+        if self._auto_load_pending:
+            self.load_folder(folder)
 
     def _install_shortcuts(self):
         for i in range(6):
@@ -706,6 +723,7 @@ class LibraryView(QWidget):
         thread.finished.connect(lambda: self._retiring_threads.remove(thread))
 
     def load_folder(self, folder: str):
+        self._auto_load_pending = False  # whatever triggered this wins -- see __init__'s comment
         if self.loader_thread and self.loader_thread.isRunning():
             self._retire_loader_thread(self.loader_thread)
 
