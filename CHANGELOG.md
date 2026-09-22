@@ -18,6 +18,15 @@ git commits.
 
 ## [Unreleased]
 
+## [1.14.1] - 2026-09-22
+### Fixed
+- Opening a folder could get silently reverted back to whatever folder
+  was open last session: startup schedules a deferred reload of the
+  last-used folder so the window can appear before a big scan starts,
+  and if Open Folder was used to pick a different folder quickly enough,
+  that still-pending reload fired moments later and overwrote the
+  choice with no indication anything had changed.
+
 ## [1.14.0] - 2026-09-21
 ### Added
 - "Delete Selected..." in the library: select 1+ photos, confirm once,
