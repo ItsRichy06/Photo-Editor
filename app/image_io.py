@@ -265,31 +265,38 @@ def get_exif_summary(path) -> dict:
 
     if is_raw(path):
         try:
-            with rawpy.imread(path) as raw:
-                other = raw.other
-                if other.iso_speed:
-                    summary["iso"] = other.iso_speed
-                if other.shutter_speed:
-                    summary["shutter"] = other.shutter_speed
-                if other.aperture:
-                    summary["aperture"] = other.aperture
-                if other.focal_length:
-                    summary["focal_length"] = other.focal_length
-                if other.timestamp:
-                    summary["date"] = other.timestamp.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            pass
-        try:
-            # rawpy/LibRaw doesn't expose camera make/model directly, and
-            # Image.open() can outright fail to identify some cameras' .ARW
-            # files (confirmed: Sony ZV-E10) since the pixel data lives in a
-            # SubIFD rather than IFD0 -- so read the TIFF tags by hand instead.
+            # Deliberately not rawpy's raw.other (iso_speed/shutter_speed/
+            # aperture/focal_length/timestamp) -- measured at 1+ second per
+            # call (it appears to trigger a much broader metadata parse
+            # under the hood), which stalled the GUI thread for that long
+            # every time a RAW photo was opened (here and in the photo
+            # viewer). _read_tiff_exif_tags reads the same values straight
+            # from the file's IFD0/EXIF-SubIFD in ~10ms -- also already
+            # needed below for camera/lens, and for stacking.py's EXIF
+            # analysis pass, so this now shares one fast code path with
+            # both instead of paying rawpy's slow one here.
             ifd0_tags, sub_tags = _read_tiff_exif_tags(path)
             camera = _combine_make_model(ifd0_tags.get("Make"), ifd0_tags.get("Model"))
             if camera:
                 summary["camera"] = camera
             if sub_tags.get("LensModel"):
                 summary["lens"] = sub_tags["LensModel"]
+
+            date = _format_exif_datetime(ifd0_tags.get("DateTime"))
+            if date:
+                summary["date"] = date
+            shutter = _rational_to_float(sub_tags.get("ExposureTime"))
+            if shutter:
+                summary["shutter"] = shutter
+            aperture = _rational_to_float(sub_tags.get("FNumber"))
+            if aperture:
+                summary["aperture"] = aperture
+            iso = sub_tags.get("ISOSpeedRatings") or sub_tags.get("PhotographicSensitivity")
+            if iso:
+                summary["iso"] = iso
+            focal_length = _rational_to_float(sub_tags.get("FocalLength"))
+            if focal_length:
+                summary["focal_length"] = focal_length
         except Exception:
             pass
     else:

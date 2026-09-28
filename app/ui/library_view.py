@@ -165,6 +165,23 @@ class PhotoListModel(QAbstractListModel):
         idx = self.index(row)
         self.dataChanged.emit(idx, idx, [self.RatingRole])
 
+    def remove_photo(self, photo_id):
+        """Surgically drop one photo (e.g. after the viewer deletes it) --
+        used instead of a full load_folder() rescan so a delete from the
+        viewer doesn't reset scroll position/filmstrip state for no reason;
+        the library grid updates too since it shares this same model."""
+        row = self._id_to_row.get(photo_id)
+        if row is None:
+            return
+        self.beginRemoveRows(QModelIndex(), row, row)
+        del self._items[row]
+        del self._id_to_row[photo_id]
+        self._thumbnails.pop(photo_id, None)
+        for pid, r in self._id_to_row.items():
+            if r > row:
+                self._id_to_row[pid] = r - 1
+        self.endRemoveRows()
+
     def unrated_photos(self) -> list:
         """[{"id", "path", "is_raw"}, ...] for every photo with no rating yet
         -- what a bulk auto-rate pass should consider, so it never touches a
