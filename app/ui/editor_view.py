@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import image_io, processing, segmentation
-from ..settings import LAST_EXPORT_FOLDER, get_settings
+from .. import auto_enhance, image_io, processing, segmentation
+from ..settings import AUTO_ENHANCE_CONSENT, LAST_EXPORT_FOLDER, get_settings
 from . import widgets
 
 PREVIEW_MAX_DIM = 2400  # long-edge px for the interactive-editing preview (full-res
@@ -1147,6 +1147,27 @@ class SegmentationThread(QThread):
         self.result_ready.emit(mask)
 
 
+class AutoEnhanceThread(QThread):
+    """Runs the local Auto Enhance model (see app/auto_enhance.py) off the UI
+    thread -- first-use model load (an ~16GB one-time download, then loading
+    those weights onto the GPU) and inference itself can both take a while,
+    which would otherwise freeze the app."""
+
+    result_ready = Signal(object)  # {"adjustments": {...}, "reasoning": str}
+
+    def __init__(self, image):
+        super().__init__()
+        self.image = image
+
+    def run(self):
+        try:
+            result = auto_enhance.suggest_adjustments(self.image)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[auto-enhance] thread failed: {exc}")
+            result = {"adjustments": {key: 0.0 for key in auto_enhance.RECIPE_FIELDS}, "reasoning": ""}
+        self.result_ready.emit(result)
+
+
 class PreviewRenderThread(QThread):
     """Persistent background worker that runs apply_recipe() off the UI
     thread. Rendering used to happen directly inside the debounce-timer
@@ -1285,9 +1306,13 @@ class EditorView(QWidget):
         self.local_sliders = {}
         self.pending_points = []  # [(img_x, img_y, label), ...] at preview resolution
         self.pending_mask = None  # bool (AI select) or float32 0..1 (brush) array at preview resolution, or None
+        self._raw_ai_mask = None  # unfeathered bool mask straight from SAM2, so the Feather
+        # slider can re-soften it without re-running segmentation; None whenever
+        # pending_mask didn't come from AI Select (brush/gradient/loaded layer)
         self.pending_adjustments = processing.default_local_adjustments()
         self.editing_layer_index = None  # index into recipe['local_adjustments'] being re-edited, or None
         self.seg_thread = None
+        self.auto_thread = None
         self._last_brush_pos = None  # (img_x, img_y) of the previous stroke point, for interpolation
         self._last_gradient_geom = None  # ("linear"|"radial", x0,y0,x1,y1) or ("polygon", points) -- lets
         # Invert/Feather changes recompute the current shape without needing a fresh drag
@@ -1479,6 +1504,21 @@ class EditorView(QWidget):
         self.histogram = widgets.HistogramWidget()
         layout.addWidget(self.histogram)
 
+        self.auto_enhance_btn = QPushButton("Auto Enhance")
+        self.auto_enhance_btn.setToolTip(
+            "Let a local AI model look at this photo and suggest exposure, contrast, "
+            "white balance, and color adjustments -- runs entirely on this machine, "
+            "first use downloads the model (~16GB, one time)."
+        )
+        self.auto_enhance_btn.clicked.connect(self._on_auto_enhance_clicked)
+        layout.addWidget(self.auto_enhance_btn)
+
+        self.auto_enhance_status = QLabel("")
+        self.auto_enhance_status.setWordWrap(True)
+        self.auto_enhance_status.setStyleSheet("color: #999999; font-size: 11px;")
+        self.auto_enhance_status.setVisible(False)
+        layout.addWidget(self.auto_enhance_status)
+
         for title, specs in SLIDER_GROUPS:
             box = QGroupBox(title)
             vbox = QVBoxLayout(box)
@@ -1590,7 +1630,9 @@ class EditorView(QWidget):
             "effect. Once placed, drag inside a shape to move it, or drag its rotate handle (the "
             "little circle on a stalk) to turn it -- Linear's two end dots can also be dragged "
             "individually to reposition/resize it. Hit Clear Selection to discard the current "
-            "shape and start a new one."
+            "shape and start a new one. Feather softens the selection's edge so an adjustment "
+            "fades in instead of cutting off sharply -- applies to AI Select's mask too, not just "
+            "Brush/Gradient."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888888; font-size: 10px;")
@@ -1752,6 +1794,49 @@ class EditorView(QWidget):
             self.canvas.set_mask_overlay(mask_for_overlay)
         self.canvas.set_pixmap(widgets.numpy_to_qpixmap(out))
         self._update_histogram_displays(out)
+
+    def _on_auto_enhance_clicked(self):
+        if self.preview_source is None or (self.auto_thread is not None and self.auto_thread.isRunning()):
+            return
+        if not auto_enhance.is_model_loaded() and not self.settings.value(AUTO_ENHANCE_CONSENT, False, type=bool):
+            choice = QMessageBox.question(
+                self,
+                "Download local AI model?",
+                "Auto Enhance uses a local AI model (Qwen2.5-VL-7B, ~16GB) that runs "
+                "entirely on this machine -- nothing about your photos is sent anywhere. "
+                "The first use downloads and caches those model weights from Hugging Face "
+                "(huggingface.co); after that it's instant to reuse.\n\n"
+                "Download it now and enable Auto Enhance?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if choice != QMessageBox.StandardButton.Yes:
+                return
+            self.settings.setValue(AUTO_ENHANCE_CONSENT, True)
+        self.auto_enhance_btn.setEnabled(False)
+        self.auto_enhance_status.setText(
+            "Analyzing…" if auto_enhance.is_model_loaded() else "Loading local AI model (first use only)…"
+        )
+        self.auto_enhance_status.setVisible(True)
+        self.auto_thread = AutoEnhanceThread(self.preview_source)
+        self.auto_thread.result_ready.connect(self._on_auto_enhance_result)
+        self.auto_thread.start()
+
+    def _on_auto_enhance_result(self, result):
+        self.auto_enhance_btn.setEnabled(True)
+        adjustments = result.get("adjustments") or {}
+        reasoning = result.get("reasoning") or ""
+        if not adjustments or not any(adjustments.values()):
+            self.auto_enhance_status.setText(
+                reasoning or "Auto Enhance couldn't suggest changes for this photo (see log for details)."
+            )
+            return
+        for key, value in adjustments.items():
+            self.recipe[key] = value
+        self._sync_sliders_from_recipe()
+        self._render_preview()
+        self._commit_history()
+        self.auto_enhance_status.setText(reasoning or "Adjustments applied.")
 
     def _on_compare_toggle(self, checked: bool):
         self._show_original = checked
@@ -1924,6 +2009,7 @@ class EditorView(QWidget):
         shape = text.lower()
         self.canvas.set_gradient_shape(shape)
         self.pending_mask = None
+        self._raw_ai_mask = None
         self._last_gradient_geom = None
         self.canvas.set_mask_overlay(None)
         self._render_preview()
@@ -1934,7 +2020,9 @@ class EditorView(QWidget):
         self._recompute_gradient_mask()
         self._render_preview()
 
-    def _on_shared_feather_changed(self, _value: float):
+    def _on_shared_feather_changed(self, value: float):
+        if self._raw_ai_mask is not None:
+            self.pending_mask = self._feather_ai_mask(self._raw_ai_mask, value)
         self._recompute_gradient_mask()
         self._render_preview()
 
@@ -2153,11 +2241,31 @@ class EditorView(QWidget):
         if mask is None:
             self.ai_status_label.setText("Selection failed -- try clicking again")
             return
-        self.pending_mask = mask
-        self.canvas.set_mask_overlay(mask)
+        self._raw_ai_mask = mask
+        self.pending_mask = self._feather_ai_mask(mask, self.brush_feather_slider.value())
+        self.canvas.set_mask_overlay(mask)  # overlay shows the true selection boundary, not the soft falloff
         device = "GPU" if segmentation.is_gpu_active() else "CPU"
         self.ai_status_label.setText(f"{device} -- {int(mask.sum())} px selected. Adjust below, then Add Layer.")
         self._render_preview()
+
+    @staticmethod
+    def _feather_ai_mask(mask: np.ndarray, feather_pct: float) -> np.ndarray:
+        """Softens a SAM2 boolean mask's edge via Gaussian blur, so a masked
+        local adjustment (e.g. brightening a selected tree) fades into the
+        surrounding pixels instead of cutting off sharply -- SAM2 itself only
+        returns a hard-edged mask, unlike the Brush/Gradient tools which
+        already build their own soft falloff in as they're drawn. Blur radius
+        is relative to the image's own shorter side so the same Feather value
+        looks similarly soft regardless of preview vs. full-res render size."""
+        m = mask.astype(np.float32)
+        feather_pct = max(0.0, min(100.0, feather_pct))
+        if feather_pct <= 0:
+            return m
+        h, w = mask.shape[:2]
+        sigma = max(1.0, (feather_pct / 100.0) * 0.03 * min(h, w))
+        ksize = int(sigma * 6) | 1  # next odd number, ~6 sigma kernel
+        blurred = cv2.GaussianBlur(m, (ksize, ksize), sigma)
+        return np.clip(blurred, 0.0, 1.0).astype(np.float32)
 
     def _on_local_adjustment_changed(self, key, value):
         self.pending_adjustments[key] = value
@@ -2170,6 +2278,7 @@ class EditorView(QWidget):
     def _clear_pending_selection(self, re_render: bool = True):
         self.pending_points = []
         self.pending_mask = None
+        self._raw_ai_mask = None
         self._last_brush_pos = None
         self._last_gradient_geom = None
         self.pending_adjustments = processing.default_local_adjustments()
@@ -2219,7 +2328,12 @@ class EditorView(QWidget):
         frame = self._segmentation_source_frame()  # masks live in the post-geometry frame, not raw preview_source
         if frame is None:
             return
-        self.pending_mask = processing.decode_mask(layer["mask"], frame.shape[:2]) > 0.5
+        # Keep the decoded mask as float (its feathered edge, if any, baked in
+        # from when it was first created) -- thresholding it here would
+        # silently harden a soft edge back to a hard cutout the moment you
+        # reopen a layer to tweak its sliders, discarding the feather.
+        self.pending_mask = processing.decode_mask(layer["mask"], frame.shape[:2])
+        self._raw_ai_mask = None  # re-feathering from raw isn't possible for an already-baked layer
         self.pending_adjustments = dict(processing.default_local_adjustments())
         self.pending_adjustments.update(layer.get("adjustments", {}))
         self.editing_layer_index = row
@@ -2228,7 +2342,7 @@ class EditorView(QWidget):
         self.canvas.set_points_overlay([])
         if not self.ai_select_btn.isChecked():
             self.ai_select_btn.setChecked(True)
-        self.canvas.set_mask_overlay(self.pending_mask)
+        self.canvas.set_mask_overlay(self.pending_mask > 0.5)  # overlay wants a boundary, not the soft falloff
         self.ai_status_label.setText(f"Editing Mask {row + 1} -- adjust below, then Add Layer to update")
         self._render_preview()
 

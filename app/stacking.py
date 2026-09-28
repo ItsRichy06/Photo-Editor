@@ -45,12 +45,18 @@ EV_ROUND = 0.2
 MIN_GROUP_SIZE = 3
 MAX_GROUP_SIZE = 9  # generous upper bound for an HDR bracket, matches real cameras' caps
 # Focus stacks run far longer than exposure brackets ever do (a deep macro
-# stack can legitimately be dozens of frames), so this is much more
+# stack can legitimately run to 50-100+ frames), so this is much more
 # generous -- mainly a backstop against a long same-exposure continuous-
 # shooting burst (sports, wildlife) being swept up as one giant "stack",
 # both for plausibility and because aligning+merging that many full-
-# resolution frames as one group would be very slow.
-MAX_FOCUS_GROUP_SIZE = 30
+# resolution frames as one group would be very slow. Previously 30, which
+# turned out to be low enough to bite a real deliberate 35-frame macro
+# stack -- it got silently chopped into a 30-frame group plus an orphaned
+# 5-frame "stack" of whatever the tail of the sequence happened to be,
+# which looked like a detection bug rather than a hardcoded cap. The
+# per-group review dialog already lets the user reject any candidate that
+# doesn't make sense, so there's little cost to being more generous here.
+MAX_FOCUS_GROUP_SIZE = 100
 
 
 @dataclass
@@ -266,6 +272,22 @@ def detect_stacks(infos: list) -> tuple[list, list]:
 # to the full-resolution image (a single warp is comparatively cheap; only
 # the iterative search benefits from working at full size).
 ECC_PROXY_MAX_DIM = 1000
+# Focus stacks need a much higher-resolution proxy than HDR brackets do.
+# Any error in the warp found on the proxy gets amplified by 1/scale when
+# it's scaled up to the full-resolution image (see _scale_warp) -- at the
+# default 1000px proxy, a real 6240px-wide photo has scale ~1/6.2, so an
+# under-a-pixel error on the proxy becomes several pixels of real
+# misalignment at full resolution. That's invisible in a smooth photo but
+# very visible in a focus stack's per-pixel sharpest-frame blending, which
+# is exactly what caused visible ghosting/haze on a real macro stack even
+# after switching to subject-masked alignment (see _align_ecc) -- fixed by
+# raising the proxy resolution specifically for focus stacks, confirmed
+# against that same real photo set at its true full resolution (not a
+# downsampled preview, which hides this exact problem). HDR brackets don't
+# need this: Mertens fusion blends smoothly across all frames rather than
+# picking a single "winner" per pixel, so it's far less sensitive to a few
+# pixels of residual misalignment.
+FOCUS_ECC_PROXY_MAX_DIM = 2600
 
 
 def _downsample_gray(img_float: np.ndarray, max_dim: int) -> tuple:
@@ -290,7 +312,85 @@ def _scale_warp(warp: np.ndarray, scale: float) -> np.ndarray:
     return (s @ warp.astype(np.float64) @ np.linalg.inv(s)).astype(np.float32)
 
 
-def _align_ecc(images_float: list, ref_index: int, motion_type) -> list:
+def _auto_subject_mask(proxies):
+    """Rough single-channel mask (uint8, 0/255) marking the busy/detailed
+    region shared by one or more grayscale proxy images (same shape), as
+    opposed to a large plain/low-texture background -- used by
+    _align_ecc's use_subject_mask to keep alignment from being pulled
+    around by a backdrop that dominates the frame's pixel count but isn't
+    the actual subject.
+
+    proxies can be a single proxy or a list of them sampled across the
+    stack -- a focus stack's subject isn't equally sharp in any single
+    frame, so relying on just the alignment reference frame misses
+    whatever part of the subject happens to be out of focus *in that one
+    frame* (confirmed on a real photo: a car's rear wing, blurry in the
+    chosen reference frame, was invisible to a single-frame mask and so
+    never got aligned against). Each proxy's own Otsu-thresholded
+    Laplacian-energy map is unioned together before morphology/blob
+    selection, so a region only needs to be sharp in *any one* sampled
+    frame to count as part of the subject.
+
+    Falls back to None (whole-frame alignment) if the result looks
+    degenerate -- too small a region to align against reliably, or so
+    large it isn't discriminating anything -- rather than risk making
+    alignment worse on a subject/background combination this wasn't
+    validated against.
+
+    The blur/morphology sizes below were tuned against a 1000px-wide
+    proxy and are scaled relative to that -- as fixed pixel counts, they
+    quietly broke once focus-stack alignment started using a much larger
+    proxy (see FOCUS_ECC_PROXY_MAX_DIM): the same 15px/25px kernels are
+    proportionally far smaller against a 2600px proxy, so they failed to
+    merge the subject's separate high-detail regions (body panels, wheel,
+    decal edges, ...) into one connected blob -- confirmed on a real photo,
+    where this fragmented into 18 disconnected pieces with the largest
+    covering under 2% of the frame, silently tripping the degenerate-
+    result fallback below and disabling subject-masking entirely without
+    any error or visible sign that it had stopped doing anything. (In
+    practice this no longer matters much since _align_ecc now always
+    calls this at a fixed, validated scale and upscales the result --
+    kept anyway as a defensive fallback for any other caller.)"""
+    if isinstance(proxies, np.ndarray):
+        proxies = [proxies]
+    h, w = proxies[0].shape[:2]
+    rel = min(h, w) / 1000.0
+    blur_sigma = max(2.0, 6.0 * rel)
+    close_k = max(3, int(round(15 * rel)) | 1)
+    dilate_k = max(3, int(round(25 * rel)) | 1)
+
+    combined = None
+    for proxy in proxies:
+        energy = cv2.Laplacian(proxy, cv2.CV_32F, ksize=5)
+        energy = cv2.GaussianBlur(np.abs(energy), (0, 0), sigmaX=blur_sigma)
+        energy_u8 = cv2.normalize(energy, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        _, frame_mask = cv2.threshold(energy_u8, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        combined = frame_mask if combined is None else cv2.bitwise_or(combined, frame_mask)
+
+    # Close small internal gaps (a subject's own low-texture surfaces --
+    # e.g. a flat painted panel -- read as "flat" too, same as background),
+    # then dilate to pull those surfaces into the mask, before picking the
+    # single largest connected blob.
+    mask = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
+    mask = cv2.dilate(mask, np.ones((dilate_k, dilate_k), np.uint8))
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return None
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    coverage = stats[largest, cv2.CC_STAT_AREA] / mask.size
+    if coverage < 0.02 or coverage > 0.85:
+        return None
+    return (labels == largest).astype(np.uint8) * 255
+
+
+def _align_ecc(
+    images_float: list,
+    ref_index: int,
+    motion_type,
+    use_subject_mask: bool = False,
+    proxy_max_dim: int = ECC_PROXY_MAX_DIM,
+    chain: bool = False,
+) -> list:
     """Align every image in images_float onto images_float[ref_index] via
     ECC (Enhanced Correlation Coefficient). Used for both HDR and focus
     stacks (with a different motion model -- see callers below): ECC is,
@@ -302,20 +402,64 @@ def _align_ecc(images_float: list, ref_index: int, motion_type) -> list:
     *worse*-aligned result than the unaligned input on this OpenCV build --
     confirmed against a synthetic case with a known exact shift -- so ECC
     is used here instead, verified against the same known-shift case.)
+
+    use_subject_mask restricts what ECC optimizes the fit against to the
+    auto-detected subject region (see _auto_subject_mask) instead of the
+    whole frame -- for a focus stack where the subject has real depth, a
+    whole-frame fit gets pulled toward whatever content dominates the
+    frame's pixel count (often a plain backdrop), which turns out to be a
+    *worse* fit for the subject even though it's a better fit overall.
+    Confirmed against a real 35-frame macro stack: whole-frame alignment
+    left the subject visibly soft/ghosted despite 0.99+ frame correlation
+    (the recovered per-frame scale factor -- consistent with focus
+    breathing -- was measurably different once the fit was restricted to
+    the subject), and switching to a subject-masked fit visibly fixed it.
     """
-    ref_proxy, scale = _downsample_gray(images_float[ref_index], ECC_PROXY_MAX_DIM)
+    ref_proxy, scale = _downsample_gray(images_float[ref_index], proxy_max_dim)
+    mask = None
+    if use_subject_mask:
+        # Detect the subject at the smaller ECC_PROXY_MAX_DIM scale regardless
+        # of proxy_max_dim, then upscale the resulting mask to match ref_proxy
+        # -- _auto_subject_mask's thresholding/morphology is a scale-sensitive
+        # heuristic (confirmed: the exact same subject fragmented into 18
+        # disconnected pieces at 2600px that cleanly formed one blob at
+        # 1000px), so detecting at a fixed, validated scale and resizing the
+        # result is more robust than re-tuning it for every possible
+        # proxy_max_dim. Sample several frames spread across the stack, not
+        # just the reference frame -- whatever part of the subject the
+        # reference frame doesn't happen to have in focus (e.g. a part at a
+        # different depth than whatever the reference was focused on) would
+        # otherwise be invisible to the mask and end up no better aligned
+        # than before subject-masking existed at all.
+        sample_idxs = sorted({round(t * (len(images_float) - 1)) for t in (0.0, 0.25, 0.5, 0.75, 1.0)})
+        mask_proxies = [_downsample_gray(images_float[i], ECC_PROXY_MAX_DIM)[0] for i in sample_idxs]
+        small_mask = _auto_subject_mask(mask_proxies)
+        if small_mask is not None:
+            mask = cv2.resize(small_mask, (ref_proxy.shape[1], ref_proxy.shape[0]), interpolation=cv2.INTER_NEAREST)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
     h, w = images_float[ref_index].shape[:2]
     warp_size = 3 if motion_type == cv2.MOTION_HOMOGRAPHY else 2
-    aligned = []
-    for i, img in enumerate(images_float):
-        if i == ref_index:
-            aligned.append(img)
-            continue
-        proxy, _ = _downsample_gray(img, ECC_PROXY_MAX_DIM)
+    n = len(images_float)
+
+    def align_one(template_proxy, i):
+        """Aligns images_float[i] onto template_proxy (already in the
+        reference frame's coordinate system, at proxy_max_dim scale) and
+        returns the full-resolution result."""
+        img = images_float[i]
+        proxy, _ = _downsample_gray(img, proxy_max_dim)
         warp = np.eye(warp_size, 3, dtype=np.float32)
         try:
-            _, warp = cv2.findTransformECC(ref_proxy, proxy, warp, motion_type, criteria, None, 5)
+            try:
+                _, warp = cv2.findTransformECC(template_proxy, proxy, warp, motion_type, criteria, mask, 5)
+            except cv2.error:
+                if mask is None:
+                    raise
+                # The subject mask made this particular frame's fit fail to
+                # converge (e.g. too little subject content visible at its
+                # focus distance) -- retry against the whole frame rather
+                # than giving up and leaving this frame fully unaligned.
+                warp = np.eye(warp_size, 3, dtype=np.float32)
+                _, warp = cv2.findTransformECC(template_proxy, proxy, warp, motion_type, criteria, None, 5)
             warp = _scale_warp(warp, scale)
             if warp_size == 3:
                 out = cv2.warpPerspective(
@@ -327,9 +471,45 @@ def _align_ecc(images_float: list, ref_index: int, motion_type) -> list:
                     img, warp, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_REPLICATE,
                 )
+            return out, True
         except cv2.error:
-            out = img  # didn't converge -- fall back to the unaligned frame rather than failing the whole stack
-        aligned.append(out)
+            return img, False  # didn't converge either way -- fall back to the unaligned frame rather than failing the whole stack
+
+    aligned = [None] * n
+    aligned[ref_index] = images_float[ref_index]
+
+    if not chain:
+        for i in range(n):
+            if i != ref_index:
+                aligned[i], _ = align_one(ref_proxy, i)
+        return aligned
+
+    # Chain mode: align each frame onto its already-aligned NEIGHBOR instead
+    # of jumping straight to one shared reference frame. A frame far from
+    # the reference (e.g. the first frame in a 35-frame stack aligned
+    # against the middle one) has accumulated far more focus breathing to
+    # correct in a single fit than an adjacent pair does -- confirmed on a
+    # real photo: a region that was genuinely sharp in the *first* source
+    # frame still came out soft in the final stack, because that frame's
+    # single big jump to the reference wasn't quite accurate enough, even
+    # with subject-masking. Chaining keeps every individual alignment step
+    # to one frame's worth of change, however many frames the stack has.
+    # On a step that fails to converge, the chain continues from the last
+    # successfully-aligned frame rather than advancing onto a fallback
+    # unaligned frame, so one bad link doesn't drag every frame after it
+    # out of alignment too.
+    template_proxy = ref_proxy
+    for i in range(ref_index + 1, n):
+        out, ok = align_one(template_proxy, i)
+        aligned[i] = out
+        if ok:
+            template_proxy, _ = _downsample_gray(out, proxy_max_dim)
+    template_proxy = ref_proxy
+    for i in range(ref_index - 1, -1, -1):
+        out, ok = align_one(template_proxy, i)
+        aligned[i] = out
+        if ok:
+            template_proxy, _ = _downsample_gray(out, proxy_max_dim)
     return aligned
 
 
@@ -343,8 +523,25 @@ def _align_translation(images_float: list, ref_index: int) -> list:
 def _align_homography(images_float: list, ref_index: int) -> list:
     """Full-homography alignment for focus stacks -- focus breathing (a
     lens's field of view subtly changing across its focus range) means a
-    simpler motion model isn't always enough."""
-    return _align_ecc(images_float, ref_index, cv2.MOTION_HOMOGRAPHY)
+    simpler motion model isn't always enough. use_subject_mask=True since
+    it's specifically the subject (not the whole frame) that a focus stack
+    needs to end up sharp; proxy_max_dim is raised well above the default
+    (see FOCUS_ECC_PROXY_MAX_DIM) since a focus stack's per-pixel frame
+    selection is far more sensitive to residual misalignment than a smooth
+    photo is; chain=True aligns each frame onto its already-aligned
+    neighbor rather than jumping straight to one shared reference frame --
+    see _align_ecc's docstring for why (confirmed necessary: a region
+    genuinely sharp in the source frame furthest from the reference still
+    came out soft in the merged stack without it, even with everything
+    else fixed)."""
+    return _align_ecc(
+        images_float,
+        ref_index,
+        cv2.MOTION_HOMOGRAPHY,
+        use_subject_mask=True,
+        proxy_max_dim=FOCUS_ECC_PROXY_MAX_DIM,
+        chain=True,
+    )
 
 
 # ------------------------------------------------------------------ merge

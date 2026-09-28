@@ -8,6 +8,7 @@ shiboken6>=6.7
 rawpy>=0.23.2
 Pillow>=10.3
 opencv-python>=4.10
+send2trash>=1.8  # library "Delete Selected" moves files to the Recycle Bin, never a permanent os.remove()
 numpy>=1.26
 
 # AI object selection (Phase 3). torch/torchvision must come from PyTorch's
@@ -24,3 +25,18 @@ numpy>=1.26
 torch==2.11.0+cu128
 torchvision==0.26.0+cu128
 ultralytics>=8.4
+
+# Auto Enhance: a local multimodal model (Qwen2.5-VL-7B-Instruct -- Apache
+# 2.0, no Hugging Face account/license-gate needed, unlike Gemma 3) looks at
+# the photo and suggests exposure/contrast/white-balance/color adjustments --
+# see app/auto_enhance.py. accelerate is needed for device_map="auto" (GPU
+# placement); transformers>=4.56 for the current `dtype=` from_pretrained()
+# argument (torch_dtype= was renamed and is deprecated as of that version).
+# First use downloads the ~16GB model weights once, cached by Hugging Face's
+# own cache dir (not this project) -- same one-time-download shape as SAM2's
+# checkpoint, just a bigger download. Gated behind an explicit in-app Yes/No
+# confirmation before it ever starts (see EditorView._on_auto_enhance_clicked)
+# -- this is a large opt-in download, not something the auto-updater or a
+# fresh install should ever pull down on its own.
+transformers>=4.56
+accelerate>=1.0
