@@ -279,8 +279,9 @@ def get_exif_summary(path) -> dict:
             camera = _combine_make_model(ifd0_tags.get("Make"), ifd0_tags.get("Model"))
             if camera:
                 summary["camera"] = camera
-            if sub_tags.get("LensModel"):
-                summary["lens"] = sub_tags["LensModel"]
+            lens = _combine_make_model(sub_tags.get("LensMake"), sub_tags.get("LensModel"))
+            if lens:
+                summary["lens"] = lens
 
             date = _format_exif_datetime(ifd0_tags.get("DateTime"))
             if date:
@@ -324,8 +325,9 @@ def get_exif_summary(path) -> dict:
                 focal_length = _rational_to_float(sub_tags.get("FocalLength"))
                 if focal_length:
                     summary["focal_length"] = focal_length
-                if sub_tags.get("LensModel"):
-                    summary["lens"] = sub_tags["LensModel"]
+                lens = _combine_make_model(sub_tags.get("LensMake"), sub_tags.get("LensModel"))
+                if lens:
+                    summary["lens"] = lens
         except Exception:
             pass
 

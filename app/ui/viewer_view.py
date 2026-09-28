@@ -6,6 +6,7 @@ navigation always matches whatever filter/sort/search is currently active
 there.
 """
 
+from collections import OrderedDict
 from html import escape
 from pathlib import Path
 
@@ -37,6 +38,12 @@ VIEWER_MAX_DIM = 2000
 FILMSTRIP_ITEM_W = 72
 FILMSTRIP_ITEM_H = 52
 FILMSTRIP_MAX_ITEM_W = 160  # cap so a folder with very few photos doesn't blow thumbnails up absurdly wide
+
+# How many decoded full previews to keep around (path -> QPixmap) so
+# stepping back to a recently-viewed photo is instant instead of re-running
+# a RAW demosaic. ~8MB/entry at VIEWER_MAX_DIM, so this stays well under
+# 100MB even at full.
+PREVIEW_CACHE_SIZE = 6
 
 
 class _ImageLoadThread(QThread):
@@ -80,11 +87,11 @@ class _ImageArea(QWidget):
 
         def _arrow_button(text: str) -> QPushButton:
             btn = QPushButton(text, self)
-            btn.setFixedSize(34, 34)
+            btn.setFixedSize(46, 46)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setStyleSheet(
                 "QPushButton { background: rgba(0,0,0,140); color: #eeeeee; border: none; "
-                "border-radius: 17px; font-size: 16px; }"
+                "border-radius: 23px; font-size: 22px; }"
                 "QPushButton:hover { background: rgba(0,0,0,200); }"
             )
             return btn
@@ -171,6 +178,61 @@ class _ScrubBar(QWidget):
         painter.drawEllipse(QPointF(fill_w, mid_y), 6, 6)
 
 
+class _SpecIcon(QWidget):
+    """Small flat vector icon for one EXIF spec row -- drawn with QPainter
+    rather than a Unicode/emoji glyph so it always renders as a plain
+    monochrome shape matching the app's flat dark UI. (Unicode glyphs like a
+    pencil or wastebasket render through Windows' color emoji font, which
+    looks visibly out of place here -- the same problem this sidesteps.)"""
+
+    def __init__(self, kind: str, size: int = 20, color: str = "#8a8a8a", parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.color = QColor(color)
+        self.setFixedSize(size, size)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.color, 1.6))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        r = self.rect().adjusted(2, 2, -2, -2)
+        cx, cy = r.center().x(), r.center().y()
+
+        if self.kind == "aperture":
+            painter.drawEllipse(r)
+            painter.setBrush(self.color)
+            painter.drawEllipse(QPointF(cx, cy), 2.2, 2.2)
+        elif self.kind == "shutter":
+            painter.drawEllipse(r)
+            painter.drawLine(cx, cy, cx, r.top() + 2)
+            painter.drawLine(cx, cy, r.right() - 3, cy)
+        elif self.kind == "iso":
+            painter.drawRect(r)
+            painter.setBrush(self.color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            box = 4
+            for dx in (0, 1):
+                for dy in (0, 1):
+                    painter.drawRect(QRect(r.left() + 2 + dx * (box + 2), r.top() + 2 + dy * (box + 2), box, box))
+        elif self.kind == "focal":
+            painter.drawLine(r.left(), cy, r.right(), cy)
+            painter.drawLine(r.left(), r.top(), r.left(), r.bottom())
+            painter.drawLine(r.right(), r.top(), r.right(), r.bottom())
+        elif self.kind == "lens":
+            painter.drawEllipse(r.adjusted(1, 1, -1, -1))
+            painter.drawEllipse(r.adjusted(6, 6, -6, -6))
+        painter.end()
+
+
+def _clear_layout(layout):
+    while layout.count():
+        item = layout.takeAt(0)
+        w = item.widget()
+        if w is not None:
+            w.deleteLater()
+
+
 class _FilmstripDelegate(QStyledItemDelegate):
     """item_width is mutable (set from outside, see
     PhotoViewerView._update_filmstrip_item_width) so a folder with few
@@ -224,6 +286,9 @@ class PhotoViewerView(QWidget):
         self._current_row = -1
         self._load_thread = None
         self._load_generation = 0
+        self._current_load_path = None
+        self._preview_cache = OrderedDict()  # path -> QPixmap, most-recently-used last
+        self._prefetch_thread = None
 
         self.setStyleSheet("background: #1c1c1c;")
         root = QVBoxLayout(self)
@@ -259,12 +324,12 @@ class PhotoViewerView(QWidget):
 
     def _build_header(self) -> QHBoxLayout:
         header = QHBoxLayout()
-        header.setContentsMargins(14, 8, 14, 8)
+        header.setContentsMargins(18, 12, 18, 12)
 
         back_btn = QPushButton("✕  Back to library")
         back_btn.setFlat(True)
         back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        back_btn.setStyleSheet("QPushButton { color: #aaaaaa; border: none; text-align: left; }")
+        back_btn.setStyleSheet("QPushButton { color: #aaaaaa; border: none; text-align: left; font-size: 15px; }")
         back_btn.clicked.connect(self.backRequested)
         header.addWidget(back_btn)
 
@@ -274,51 +339,56 @@ class PhotoViewerView(QWidget):
         self.type_filter.addItems(["All formats", "JPEG only", "RAW only"])
         self.type_filter.setToolTip("Filter which photos you navigate through here (shared with the library).")
         self.type_filter.currentIndexChanged.connect(self._on_type_filter_changed)
+        self.type_filter.setStyleSheet("font-size: 14px; padding: 3px 6px;")
         header.addWidget(self.type_filter)
 
         self.position_label = QLabel("")
-        self.position_label.setStyleSheet("color: #888888; font-size: 12px; margin-left: 14px;")
+        self.position_label.setStyleSheet("color: #999999; font-size: 15px; margin-left: 16px;")
         header.addWidget(self.position_label)
         return header
 
     def _build_side_panel(self) -> QWidget:
+        # Two earlier widening passes (148->190->260px) grew every element,
+        # each confirmed by pixel-measuring real screenshots, but still read
+        # as "unchanged" on a real screen and lacked the sketch's icon rows
+        # for individual specs. This pass widens further, makes Edit/Delete
+        # real full-width buttons with real vertical weight (not padding on
+        # a text label), and gives every EXIF spec its own icon + row.
         panel = QWidget()
-        panel.setFixedWidth(148)
+        panel.setFixedWidth(320)
         panel.setStyleSheet("background: #202020;")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(14, 14, 14, 0)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 24, 24, 0)
+        layout.setSpacing(20)
 
-        # Plain text, no icon glyph -- matches every other button in the app
-        # (Open Folder..., Stack Photos..., Delete Selected...), and sidesteps
-        # Windows rendering emoji-ish Unicode glyphs (a pencil, a wastebasket)
-        # in its color emoji font, which looks visibly out of place next to
-        # flat vector UI chrome.
         self.edit_btn = QPushButton("Edit")
         self.edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.edit_btn.setFixedHeight(58)
         self.edit_btn.setStyleSheet(
-            "QPushButton { background: #1d9e75; color: #08211a; font-weight: 500; border: none; "
-            "border-radius: 6px; padding: 9px 0; font-size: 13px; }"
+            "QPushButton { background: #1d9e75; color: #08211a; font-weight: 600; border: none; "
+            "border-radius: 8px; font-size: 20px; }"
             "QPushButton:hover { background: #24b989; }"
         )
         self.edit_btn.clicked.connect(self._on_edit_clicked)
         layout.addWidget(self.edit_btn)
 
-        # Rich text, not a QSS "line-height" (not a property QLabel's
-        # stylesheet engine actually supports -- silently ignored, which is
-        # why this used to render as cramped single-spaced lines): per-line
-        # <div style="margin-bottom"> is real spacing Qt's rich text engine
-        # honors. The camera name gets a brighter shade than the specs
-        # underneath it for a little visual hierarchy.
-        self.exif_label = QLabel("")
-        self.exif_label.setTextFormat(Qt.TextFormat.RichText)
-        self.exif_label.setWordWrap(True)
-        self.exif_label.setStyleSheet("font-size: 11px;")
-        layout.addWidget(self.exif_label)
+        self.camera_label = QLabel("")
+        self.camera_label.setWordWrap(True)
+        self.camera_label.setStyleSheet("color: #cfcfcf; font-size: 17px; font-weight: 500; margin-top: 2px;")
+        layout.addWidget(self.camera_label)
+
+        # Each spec (lens, focal length, aperture, shutter, ISO) gets its own
+        # row with a small drawn icon -- rebuilt per-photo since which specs
+        # exist varies (see _populate_exif), rather than one rich-text block.
+        self.exif_container = QWidget()
+        self.exif_layout = QVBoxLayout(self.exif_container)
+        self.exif_layout.setContentsMargins(0, 6, 0, 0)
+        self.exif_layout.setSpacing(14)
+        layout.addWidget(self.exif_container)
 
         layout.addStretch(1)
 
-        self.rating_widget = widgets.StarRatingWidget(star_size=18)
+        self.rating_widget = widgets.StarRatingWidget(star_size=32)
         self.rating_widget.ratingChanged.connect(self._on_rating_changed)
         rating_row = QHBoxLayout()
         rating_row.addStretch(1)
@@ -326,16 +396,30 @@ class PhotoViewerView(QWidget):
         rating_row.addStretch(1)
         layout.addLayout(rating_row)
 
-        delete_btn = QPushButton("Delete")
-        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        delete_btn.setStyleSheet(
-            "QPushButton { background: none; color: #dd8888; border: none; border-top: 1px solid #333333; "
-            "padding: 10px 0 12px; font-size: 12px; margin-top: 4px; }"
-            "QPushButton:hover { color: #ff9d9d; }"
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_btn.setFixedHeight(50)
+        self.delete_btn.setStyleSheet(
+            "QPushButton { background: #2a1e1e; color: #e28f8f; border: 1px solid #4a2b2b; "
+            "border-radius: 8px; font-weight: 500; font-size: 16px; margin-top: 4px; }"
+            "QPushButton:hover { background: #3a2222; color: #ff9d9d; border-color: #6b3535; }"
         )
-        delete_btn.clicked.connect(self._on_delete_clicked)
-        layout.addWidget(delete_btn)
+        self.delete_btn.clicked.connect(self._on_delete_clicked)
+        layout.addWidget(self.delete_btn)
+        layout.addSpacing(20)
         return panel
+
+    def _spec_row(self, kind: str, text: str) -> QWidget:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(12)
+        row_layout.addWidget(_SpecIcon(kind))
+        label = QLabel(escape(text))
+        label.setWordWrap(True)
+        label.setStyleSheet("color: #9c9c9c; font-size: 16px;")
+        row_layout.addWidget(label, stretch=1)
+        return row
 
     def _build_filmstrip(self) -> QListView:
         self.filmstrip = QListView()
@@ -393,6 +477,7 @@ class PhotoViewerView(QWidget):
         proxy.rowsInserted.connect(self._on_proxy_changed)
         proxy.rowsRemoved.connect(self._on_proxy_changed)
         proxy.layoutChanged.connect(self._on_proxy_changed)
+        self._preview_cache.clear()  # a different folder/filter means a different set of paths
 
     def open_photo(self, photo_id: int):
         if self.proxy is None:
@@ -439,14 +524,30 @@ class PhotoViewerView(QWidget):
 
         self.position_label.setText(f"{name}    ·    {row + 1} of {total}")
         self.rating_widget.set_rating(rating)
-        self.exif_label.setText(self._format_exif(path))
+        self._populate_exif(path)
         self.scrub_bar.set_fraction(row / (total - 1) if total > 1 else 0.0)
 
         self.filmstrip.setCurrentIndex(index)
         self.filmstrip.scrollTo(index, QListView.ScrollHint.EnsureVisible)
 
         self._load_generation += 1
+        cached = self._preview_cache.get(path)
+        if cached is not None:
+            self._preview_cache.move_to_end(path)
+            self.image_area.set_pixmap(cached)
+            self._schedule_prefetch()
+            return
+
+        # Instant low-res placeholder from the thumbnail already decoded for
+        # the library grid/filmstrip -- swapped for the full decode as soon
+        # as it's ready, so a slow RAW demosaic doesn't show a blank/stale
+        # frame while it runs.
+        thumb = index.data(Qt.ItemDataRole.DecorationRole)
+        if thumb is not None and not thumb.isNull():
+            self.image_area.set_pixmap(thumb)
+
         generation = self._load_generation
+        self._current_load_path = path
         self._load_thread = _ImageLoadThread(path, generation, self)
         self._load_thread.loaded.connect(self._on_image_loaded)
         self._load_thread.start()
@@ -454,40 +555,75 @@ class PhotoViewerView(QWidget):
     def _on_image_loaded(self, generation: int, pixmap):
         if generation != self._load_generation:
             return  # superseded by a newer navigation before this finished
+        if pixmap is not None:
+            self._cache_preview(self._current_load_path, pixmap)
         self.image_area.set_pixmap(pixmap)
+        self._schedule_prefetch()
 
-    @staticmethod
-    def _format_exif(path) -> str:
-        """Returns rich-text HTML (see exif_label's setTextFormat) -- a
-        camera name in a slightly brighter shade than the specs below it,
-        each line spaced with a real margin rather than the font's default
-        single-spacing."""
+    def _cache_preview(self, path, pixmap):
+        self._preview_cache[path] = pixmap
+        self._preview_cache.move_to_end(path)
+        while len(self._preview_cache) > PREVIEW_CACHE_SIZE:
+            self._preview_cache.popitem(last=False)
+
+    def _schedule_prefetch(self):
+        """Decodes the neighbor photo(s) of the current row in the
+        background, one at a time, so arrow-key navigation across
+        already-visited or about-to-be-visited photos hits the cache
+        instead of paying for a RAW demosaic on every keypress."""
+        if self.proxy is None or (self._prefetch_thread is not None and self._prefetch_thread.isRunning()):
+            return
+        total = self.proxy.rowCount()
+        for neighbor_row in (self._current_row + 1, self._current_row - 1):
+            if not (0 <= neighbor_row < total):
+                continue
+            path = self.proxy.index(neighbor_row, 0).data(PhotoListModel.PathRole)
+            if path in self._preview_cache or path == self._current_load_path:
+                continue
+            thread = _ImageLoadThread(path, 0, self)
+            thread.loaded.connect(lambda _gen, pixmap, path=path: self._on_prefetched(path, pixmap))
+            self._prefetch_thread = thread
+            thread.start()
+            return
+
+    def _on_prefetched(self, path, pixmap):
+        if pixmap is not None:
+            self._cache_preview(path, pixmap)
+        self._prefetch_thread = None
+        self._schedule_prefetch()  # chain onto the other neighbor, if it's still missing
+
+    def _populate_exif(self, path):
+        """Rebuilds the icon-row EXIF list for the current photo -- which
+        specs exist varies per file, so the rows are rebuilt each time
+        rather than kept as fixed widgets with hidden/shown states."""
         try:
             summary = image_io.get_exif_summary(path)
         except Exception:  # noqa: BLE001 -- info panel is best-effort
             summary = {}
 
-        html_lines = []
         camera = summary.get("camera")
-        if camera:
-            html_lines.append(f'<div style="color:#bbbbbb; margin-bottom:5px;">{escape(camera)}</div>')
+        self.camera_label.setText(escape(camera) if camera else "")
+        self.camera_label.setVisible(bool(camera))
 
-        specs = []
+        _clear_layout(self.exif_layout)
+
+        lens = summary.get("lens")
+        if lens:
+            self.exif_layout.addWidget(self._spec_row("lens", lens))
+
         aperture, shutter, iso, focal = (
             summary.get("aperture"), summary.get("shutter"), summary.get("iso"), summary.get("focal_length"),
         )
         if focal:
-            specs.append(f"{focal:.0f}mm" if aperture is None else f"{focal:.0f}mm  ƒ/{aperture:.1f}".replace(".0", ""))
-        elif aperture:
-            specs.append(f"ƒ/{aperture:.1f}".replace(".0", ""))
+            self.exif_layout.addWidget(self._spec_row("focal", f"{focal:.0f}mm"))
+        if aperture:
+            self.exif_layout.addWidget(self._spec_row("aperture", f"ƒ/{aperture:.1f}".replace(".0", "")))
         if shutter:
-            specs.append(f"1/{round(1.0 / shutter)}s" if shutter < 1 else f"{shutter:.1f}s")
+            text = f"1/{round(1.0 / shutter)}s" if shutter < 1 else f"{shutter:.1f}s"
+            self.exif_layout.addWidget(self._spec_row("shutter", text))
         if iso:
-            specs.append(f"ISO {iso:.0f}" if isinstance(iso, float) else f"ISO {iso}")
-        for spec in specs:
-            html_lines.append(f'<div style="color:#888888; margin-bottom:4px;">{escape(spec)}</div>')
-
-        return "".join(html_lines)
+            text = f"ISO {iso:.0f}" if isinstance(iso, float) else f"ISO {iso}"
+            self.exif_layout.addWidget(self._spec_row("iso", text))
 
     # ---------------------------------------------------------- navigation
 
