@@ -6,6 +6,7 @@ navigation always matches whatever filter/sort/search is currently active
 there.
 """
 
+from html import escape
 from pathlib import Path
 
 import send2trash
@@ -288,7 +289,12 @@ class PhotoViewerView(QWidget):
         layout.setContentsMargins(14, 14, 14, 0)
         layout.setSpacing(10)
 
-        self.edit_btn = QPushButton("✎  Edit")
+        # Plain text, no icon glyph -- matches every other button in the app
+        # (Open Folder..., Stack Photos..., Delete Selected...), and sidesteps
+        # Windows rendering emoji-ish Unicode glyphs (a pencil, a wastebasket)
+        # in its color emoji font, which looks visibly out of place next to
+        # flat vector UI chrome.
+        self.edit_btn = QPushButton("Edit")
         self.edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.edit_btn.setStyleSheet(
             "QPushButton { background: #1d9e75; color: #08211a; font-weight: 500; border: none; "
@@ -298,9 +304,16 @@ class PhotoViewerView(QWidget):
         self.edit_btn.clicked.connect(self._on_edit_clicked)
         layout.addWidget(self.edit_btn)
 
+        # Rich text, not a QSS "line-height" (not a property QLabel's
+        # stylesheet engine actually supports -- silently ignored, which is
+        # why this used to render as cramped single-spaced lines): per-line
+        # <div style="margin-bottom"> is real spacing Qt's rich text engine
+        # honors. The camera name gets a brighter shade than the specs
+        # underneath it for a little visual hierarchy.
         self.exif_label = QLabel("")
+        self.exif_label.setTextFormat(Qt.TextFormat.RichText)
         self.exif_label.setWordWrap(True)
-        self.exif_label.setStyleSheet("color: #999999; font-size: 11px; line-height: 145%;")
+        self.exif_label.setStyleSheet("font-size: 11px;")
         layout.addWidget(self.exif_label)
 
         layout.addStretch(1)
@@ -313,7 +326,7 @@ class PhotoViewerView(QWidget):
         rating_row.addStretch(1)
         layout.addLayout(rating_row)
 
-        delete_btn = QPushButton("\U0001f5d1  Delete")
+        delete_btn = QPushButton("Delete")
         delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         delete_btn.setStyleSheet(
             "QPushButton { background: none; color: #dd8888; border: none; border-top: 1px solid #333333; "
@@ -445,26 +458,36 @@ class PhotoViewerView(QWidget):
 
     @staticmethod
     def _format_exif(path) -> str:
+        """Returns rich-text HTML (see exif_label's setTextFormat) -- a
+        camera name in a slightly brighter shade than the specs below it,
+        each line spaced with a real margin rather than the font's default
+        single-spacing."""
         try:
             summary = image_io.get_exif_summary(path)
         except Exception:  # noqa: BLE001 -- info panel is best-effort
             summary = {}
-        lines = []
+
+        html_lines = []
         camera = summary.get("camera")
         if camera:
-            lines.append(camera)
+            html_lines.append(f'<div style="color:#bbbbbb; margin-bottom:5px;">{escape(camera)}</div>')
+
+        specs = []
         aperture, shutter, iso, focal = (
             summary.get("aperture"), summary.get("shutter"), summary.get("iso"), summary.get("focal_length"),
         )
         if focal:
-            lines.append(f"{focal:.0f}mm" if aperture is None else f"{focal:.0f}mm  ƒ/{aperture:.1f}".replace(".0", ""))
+            specs.append(f"{focal:.0f}mm" if aperture is None else f"{focal:.0f}mm  ƒ/{aperture:.1f}".replace(".0", ""))
         elif aperture:
-            lines.append(f"ƒ/{aperture:.1f}".replace(".0", ""))
+            specs.append(f"ƒ/{aperture:.1f}".replace(".0", ""))
         if shutter:
-            lines.append(f"1/{round(1.0 / shutter)}s" if shutter < 1 else f"{shutter:.1f}s")
+            specs.append(f"1/{round(1.0 / shutter)}s" if shutter < 1 else f"{shutter:.1f}s")
         if iso:
-            lines.append(f"ISO {iso:.0f}" if isinstance(iso, float) else f"ISO {iso}")
-        return "\n".join(lines)
+            specs.append(f"ISO {iso:.0f}" if isinstance(iso, float) else f"ISO {iso}")
+        for spec in specs:
+            html_lines.append(f'<div style="color:#888888; margin-bottom:4px;">{escape(spec)}</div>')
+
+        return "".join(html_lines)
 
     # ---------------------------------------------------------- navigation
 
