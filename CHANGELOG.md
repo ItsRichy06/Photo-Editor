@@ -18,6 +18,22 @@ git commits.
 
 ## [Unreleased]
 
+## [1.16.1] - 2026-09-29
+### Fixed
+- The photo viewer could crash after a few photos and stuttered while
+  browsing a large folder: it restarted a fresh image decode every time
+  the library's photo list signaled a change (including every thumbnail
+  that finished loading), so hundreds of decodes piled up at once. It now
+  decodes one photo at a time and only ever the latest one asked for.
+- Switching the viewer (or the library) to RAW only / JPEG only could
+  crash the app on a large RAW+JPEG folder. Switching is now instant and
+  stays on the same shot -- e.g. viewing DSC0001.ARW and choosing JPEG only
+  lands on DSC0001.JPG.
+### Changed
+- The viewer shows RAW photos using the camera's own embedded full-size
+  preview, so stepping through RAWs is several times faster (about 0.1s
+  per photo instead of 0.7s). The editor still does its full RAW decode.
+
 ## [1.16.0] - 2026-09-29
 ### Added
 - The library now remembers whether a rating was set by hand or by
