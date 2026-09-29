@@ -71,6 +71,7 @@ class PhotoListModel(QAbstractListModel):
     PhotoIdRole = Qt.ItemDataRole.UserRole + 6
     NameRole = Qt.ItemDataRole.UserRole + 7
     SourceKindRole = Qt.ItemDataRole.UserRole + 8  # None | "focus" | "hdr" -- see Catalog.set_source_kind
+    RatingSourceRole = Qt.ItemDataRole.UserRole + 9  # None | "manual" | "auto" -- see Catalog.set_rating
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -108,6 +109,8 @@ class PhotoListModel(QAbstractListModel):
             return item["name"]
         if role == self.SourceKindRole:
             return item["source_kind"]
+        if role == self.RatingSourceRole:
+            return item["rating_source"]
         return None
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
@@ -118,6 +121,8 @@ class PhotoListModel(QAbstractListModel):
             item["rating"] = value
         elif role == self.FlagRole:
             item["flag"] = value
+        elif role == self.RatingSourceRole:
+            item["rating_source"] = value
         else:
             return False
         self.dataChanged.emit(index, index, [role])
@@ -141,6 +146,7 @@ class PhotoListModel(QAbstractListModel):
                     "is_raw": is_raw,
                     "name": Path(photo["path"]).name,
                     "source_kind": photo.get("source_kind"),
+                    "rating_source": photo.get("rating_source"),
                 }
             )
             self._id_to_row[photo["id"]] = row
@@ -154,7 +160,7 @@ class PhotoListModel(QAbstractListModel):
         idx = self.index(row)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
 
-    def set_rating_by_id(self, photo_id, rating: int):
+    def set_rating_by_id(self, photo_id, rating: int, source: str | None = None):
         """Like setData(..., RatingRole) but addressed by photo id -- for
         callers (e.g. a background auto-rate pass) that only have the id,
         not a QModelIndex into the current (possibly filtered/sorted) view."""
@@ -162,8 +168,9 @@ class PhotoListModel(QAbstractListModel):
         if row is None:
             return
         self._items[row]["rating"] = rating
+        self._items[row]["rating_source"] = source if rating > 0 else None
         idx = self.index(row)
-        self.dataChanged.emit(idx, idx, [self.RatingRole])
+        self.dataChanged.emit(idx, idx, [self.RatingRole, self.RatingSourceRole])
 
     def remove_photo(self, photo_id):
         """Surgically drop one photo (e.g. after the viewer deletes it) --
@@ -204,6 +211,7 @@ class PhotoFilterProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.rating_filter = 0  # 0 = no filter, else an exact 1-5 star match
+        self.rating_source_filter = "all"  # "all" | "manual" | "auto"
         self.type_filter = "all"
         self.kind_filter = "all"  # "all" | "focus" | "hdr" | "originals"
         self.search_text = ""
@@ -215,6 +223,13 @@ class PhotoFilterProxy(QSortFilterProxyModel):
         that many stars (not "at least" -- exact, so you can isolate e.g.
         just the 2-stars still waiting on a second look)."""
         self.rating_filter = rating
+        self.invalidateFilter()
+
+    def set_rating_source_filter(self, source: str):
+        """source: "all", "manual" (only your own ratings), or "auto" (only
+        ratings Auto-Rate Unrated filled in) -- lets the two be told apart
+        even though they share the same 1-5 star scale."""
+        self.rating_source_filter = source
         self.invalidateFilter()
 
     def set_type_filter(self, type_filter: str):
@@ -239,6 +254,9 @@ class PhotoFilterProxy(QSortFilterProxyModel):
         if self.rating_filter > 0:
             rating = index.data(PhotoListModel.RatingRole) or 0
             if rating != self.rating_filter:
+                return False
+        if self.rating_source_filter != "all":
+            if index.data(PhotoListModel.RatingSourceRole) != self.rating_source_filter:
                 return False
         if self.type_filter != "all":
             is_raw = bool(index.data(PhotoListModel.IsRawRole))
@@ -332,6 +350,7 @@ class PhotoDelegate(QStyledItemDelegate):
                 current = index.data(PhotoListModel.RatingRole) or 0
                 new_rating = 0 if star_idx == current else star_idx
                 model.setData(index, new_rating, PhotoListModel.RatingRole)
+                model.setData(index, "manual" if new_rating > 0 else None, PhotoListModel.RatingSourceRole)
                 self.ratingEdited.emit(photo_id, new_rating)
                 return True
         return super().editorEvent(event, model, option, index)
@@ -503,7 +522,7 @@ class AutoRateThread(QThread):
                 self.progress.emit(done, total)
                 continue
             for member in members:
-                self.catalog.set_rating(member["id"], rating)
+                self.catalog.set_rating(member["id"], rating, source="auto")
                 self.photo_rated.emit(member["id"], rating)
                 rated_count += 1
             done += 1
@@ -605,6 +624,13 @@ class LibraryView(QWidget):
         self.rating_filter.currentIndexChanged.connect(lambda i: self.proxy.set_rating_filter(i))
         toolbar.addWidget(self.rating_filter)
 
+        toolbar.addWidget(QLabel("Rated by:"))
+        self.rating_source_filter = QComboBox()
+        self.rating_source_filter.addItems(["All", "My ratings", "Auto-rated"])
+        self.rating_source_filter.setToolTip("Show only photos you rated yourself, or only ones Auto-Rate filled in.")
+        self.rating_source_filter.currentIndexChanged.connect(self._on_rating_source_filter_changed)
+        toolbar.addWidget(self.rating_source_filter)
+
         toolbar.addWidget(QLabel("Sort:"))
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["Name", "Date modified", "Rating"])
@@ -697,8 +723,9 @@ class LibraryView(QWidget):
         if index is None:
             return
         photo_id = index.data(PhotoListModel.PhotoIdRole)
-        self.catalog.set_rating(photo_id, rating)
+        self.catalog.set_rating(photo_id, rating, source="manual")
         self.proxy.setData(index, rating, PhotoListModel.RatingRole)
+        self.proxy.setData(index, "manual" if rating > 0 else None, PhotoListModel.RatingSourceRole)
 
     def _flag_selected(self, flag: str):
         index = self._current_index()
@@ -987,7 +1014,7 @@ class LibraryView(QWidget):
             self._auto_rate_progress.setValue(done)
 
     def _on_photo_rated(self, photo_id: int, rating: int):
-        self.model.set_rating_by_id(photo_id, rating)
+        self.model.set_rating_by_id(photo_id, rating, source="auto")
 
     def _on_auto_rate_finished(self, rated_count: int):
         if self._auto_rate_progress is not None:
@@ -1008,13 +1035,16 @@ class LibraryView(QWidget):
         self.openPhotoRequested.emit(photo_id, path)
 
     def _on_rating_edited(self, photo_id: int, rating: int):
-        self.catalog.set_rating(photo_id, rating)
+        self.catalog.set_rating(photo_id, rating, source="manual")
 
     def _on_type_filter_changed(self, idx: int):
         self.proxy.set_type_filter({0: "all", 1: "jpeg", 2: "raw"}.get(idx, "all"))
 
     def _on_kind_filter_changed(self, idx: int):
         self.proxy.set_kind_filter({0: "all", 1: "originals", 2: "focus", 3: "hdr"}.get(idx, "all"))
+
+    def _on_rating_source_filter_changed(self, idx: int):
+        self.proxy.set_rating_source_filter({0: "all", 1: "manual", 2: "auto"}.get(idx, "all"))
 
     def _on_sort_changed(self, idx: int):
         self.proxy.set_sort_mode({0: "name", 1: "date", 2: "rating"}.get(idx, "name"))

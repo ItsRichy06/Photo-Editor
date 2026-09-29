@@ -116,6 +116,10 @@ class Catalog:
         # need a real migration rather than just extending the CREATE TABLE
         # above (which only runs for a brand-new database).
         self._add_column_if_missing("photos", "source_kind", "TEXT")
+        # NULL for an unrated photo, else "manual" (set by the user) or
+        # "auto" (filled in by Auto-Rate Unrated) -- lets the library
+        # distinguish/filter the two separately from the rating value itself.
+        self._add_column_if_missing("photos", "rating_source", "TEXT")
         self.conn.commit()
 
     def _add_column_if_missing(self, table: str, column: str, coltype: str):
@@ -209,10 +213,19 @@ class Catalog:
             )
             self.conn.commit()
 
-    def set_rating(self, photo_id: int, rating: int):
+    def set_rating(self, photo_id: int, rating: int, source: str = "manual"):
+        """source: "manual" (the user rated it) or "auto" (Auto-Rate Unrated
+        filled it in) -- ignored and stored as NULL when clearing a rating
+        back to 0, since an unrated photo has no source to remember."""
         rating = max(0, min(5, int(rating)))
+        if source not in ("manual", "auto"):
+            raise ValueError(f"invalid rating source: {source}")
+        stored_source = source if rating > 0 else None
         with self._lock:
-            self.conn.execute("UPDATE photos SET rating=? WHERE id=?", (rating, photo_id))
+            self.conn.execute(
+                "UPDATE photos SET rating=?, rating_source=? WHERE id=?",
+                (rating, stored_source, photo_id),
+            )
             self.conn.commit()
 
     def set_flag(self, photo_id: int, flag: str):
