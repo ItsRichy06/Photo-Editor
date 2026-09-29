@@ -18,6 +18,32 @@ git commits.
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-09-28
+### Added
+- A full-size photo viewer ("loupe" view): double-click a photo to open it
+  near-fullscreen with prev/next arrow buttons, a draggable scrub bar, and
+  a filmstrip along the bottom for fast browsing before deciding whether to
+  edit. Arrow keys navigate, Escape returns to the library, and the
+  RAW/JPEG format filter is shared live with the library grid.
+- The viewer's side panel: an Edit button that routes straight into the
+  existing editor, a five-star rating control, and a Delete button that
+  sends the file to the Recycle Bin (not a permanent delete) and removes it
+  from the catalog and library grid in place.
+- Shooting info in the viewer, each on its own row with a small icon:
+  camera, lens (including brand -- Sigma, Tamron, Viltrox, Sony, etc. --
+  read from the file's LensMake tag when the lens/camera writes one),
+  focal length, aperture, shutter speed, and ISO.
+### Changed
+- Viewer navigation shows the library's already-loaded thumbnail instantly
+  while the full-resolution preview decodes in the background, and
+  prefetches the next/previous photo so stepping through a set with arrow
+  keys is close to instant after the first photo.
+### Fixed
+- `get_exif_summary()` for RAW files was decoding via rawpy's `raw.other`
+  accessor, which triggers a broad metadata parse (~1.1s/file) -- switched
+  to the existing fast hand-rolled TIFF/IFD tag reader (~10ms/file), so
+  opening the viewer on a RAW photo doesn't stall.
+
 ## [1.14.1] - 2026-09-22
 ### Fixed
 - Opening a folder could get silently reverted back to whatever folder
