@@ -6,14 +6,15 @@ navigation always matches whatever filter/sort/search is currently active
 there.
 """
 
+import threading
 from collections import OrderedDict
 from html import escape
 from pathlib import Path
 
 import send2trash
 
-from PySide6.QtCore import QEvent, QModelIndex, QPointF, QRect, QSize, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtCore import QObject, QPointF, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -40,33 +41,77 @@ FILMSTRIP_ITEM_H = 52
 FILMSTRIP_MAX_ITEM_W = 160  # cap so a folder with very few photos doesn't blow thumbnails up absurdly wide
 
 # How many decoded full previews to keep around (path -> QPixmap) so
-# stepping back to a recently-viewed photo is instant instead of re-running
-# a RAW demosaic. ~8MB/entry at VIEWER_MAX_DIM, so this stays well under
-# 100MB even at full.
-PREVIEW_CACHE_SIZE = 6
+# stepping back to a recently-viewed photo is instant. ~10MB/entry at
+# VIEWER_MAX_DIM, so this stays around 100MB even at full.
+PREVIEW_CACHE_SIZE = 10
+# Neighbors decoded ahead of time after the current photo is showing:
+# forward first (the usual browsing direction), then one back.
+PREFETCH_OFFSETS = (1, 2, -1)
 
 
-class _ImageLoadThread(QThread):
-    """Decodes one photo's preview off the GUI thread. generation lets the
-    caller discard a stale result if the user navigated again before this
-    finished (holding an arrow key fires several of these in a row) --
-    the same pattern editor_view.py's render thread uses."""
+def _decode_to_qimage(path):
+    img = image_io.load_display_image(path, VIEWER_MAX_DIM)
+    data = img.tobytes("raw", "RGB")
+    # .copy() so the QImage owns its pixels instead of borrowing `data`,
+    # which Python frees as soon as this function returns.
+    return QImage(data, img.width, img.height, img.width * 3, QImage.Format.Format_RGB888).copy()
 
-    loaded = Signal(int, object)  # generation, QPixmap | None on failure
 
-    def __init__(self, path, generation: int, parent=None):
+class _PreviewLoader(QObject):
+    """One long-lived background worker that decodes viewer previews.
+
+    Replaces a thread-per-navigation design that had two real crash
+    causes: (1) it built QPixmaps on worker threads, which Qt only supports
+    on the GUI thread -- this hands back a QImage (safe to build anywhere)
+    and the GUI thread converts it; and (2) nothing bounded how many decodes
+    ran at once -- every arrow press, every filter-change row range, and
+    every thumbnail arriving in the library started another one, measured
+    at 600+ concurrent RAW decodes from 35 arrow presses. Here only the
+    newest request is kept (older ones are dropped, not queued), so at
+    most one decode ever runs.
+
+    A plain daemon thread, not a QThread: shutting a QThread down cleanly
+    needs QThread.wait() on the GUI thread, which doesn't release the GIL
+    (see LibraryView._retire_loader_thread), and one left running at exit
+    aborts the process."""
+
+    loaded = Signal(str, object)  # path, QImage | None on failure
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.path = path
-        self.generation = generation
+        self._cond = threading.Condition()
+        self._wanted = None
+        self._prefetch = []
+        self._thread = threading.Thread(target=self._run, name="viewer-preview-loader", daemon=True)
+        self._thread.start()
 
-    def run(self):
-        try:
-            arr = image_io.load_preview_float(self.path, max_dim=VIEWER_MAX_DIM)
-            pixmap = widgets.numpy_to_qpixmap(arr)
-        except Exception as exc:  # noqa: BLE001 -- show a blank frame, not a crash
-            print(f"[viewer] failed to load {self.path}: {exc}")
-            pixmap = None
-        self.loaded.emit(self.generation, pixmap)
+    def request(self, path, prefetch=()):
+        """path: photo to show now (None if it's already cached); prefetch:
+        neighbors to decode afterward, in order. Replaces any earlier
+        request that hasn't started decoding yet."""
+        with self._cond:
+            self._wanted = path
+            self._prefetch = [p for p in prefetch if p != path]
+            self._cond.notify()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while self._wanted is None and not self._prefetch:
+                    self._cond.wait()
+                if self._wanted is not None:
+                    path, self._wanted = self._wanted, None
+                else:
+                    path = self._prefetch.pop(0)
+            try:
+                qimage = _decode_to_qimage(path)
+            except Exception as exc:  # noqa: BLE001 -- show a blank frame, not a crash
+                print(f"[viewer] failed to load {path}: {exc}")
+                qimage = None
+            try:
+                self.loaded.emit(path, qimage)
+            except RuntimeError:
+                return  # the viewer (and this QObject) was destroyed, e.g. at app exit
 
 
 class _ImageArea(QWidget):
@@ -284,11 +329,23 @@ class PhotoViewerView(QWidget):
         self._library_view = library_view
         self.proxy = None
         self._current_row = -1
-        self._load_thread = None
-        self._load_generation = 0
-        self._current_load_path = None
+        self._current_id = None
+        self._current_path = None
         self._preview_cache = OrderedDict()  # path -> QPixmap, most-recently-used last
-        self._prefetch_thread = None
+        self._loader = _PreviewLoader(self)
+        self._loader.loaded.connect(self._on_preview_loaded)
+
+        # The shared proxy can emit a burst of signals for one logical
+        # change: switching to RAW-only on a RAW+JPEG library removes every
+        # other row, one rowsRemoved per row -- thousands on a real
+        # 13,500-photo folder -- and every thumbnail finishing in the
+        # background emits another. Reacting to each one individually is what
+        # made the viewer crash on filter changes and stutter while
+        # browsing; this collapses a burst into one update once it's over.
+        self._proxy_change_timer = QTimer(self)
+        self._proxy_change_timer.setSingleShot(True)
+        self._proxy_change_timer.setInterval(0)
+        self._proxy_change_timer.timeout.connect(self._apply_proxy_change)
 
         self.setStyleSheet("background: #1c1c1c;")
         root = QVBoxLayout(self)
@@ -428,6 +485,10 @@ class PhotoViewerView(QWidget):
         self.filmstrip.setViewMode(QListView.ViewMode.IconMode)
         self.filmstrip.setFlow(QListView.Flow.LeftToRight)
         self.filmstrip.setWrapping(False)
+        # Every item is the same size, and without this Qt asks the delegate
+        # for each item's size separately on every layout -- 13,500+ calls
+        # on a real folder, measured as a ~2s freeze opening the viewer.
+        self.filmstrip.setUniformItemSizes(True)
         self.filmstrip.setResizeMode(QListView.ResizeMode.Adjust)
         self.filmstrip.setSpacing(2)
         self.filmstrip.setSelectionMode(QListView.SelectionMode.SingleSelection)
@@ -468,16 +529,16 @@ class PhotoViewerView(QWidget):
     def set_source(self, proxy):
         """Attach to the library's live filtered/sorted model -- navigation
         here always matches whatever's currently visible in the grid."""
+        signals = ("rowsInserted", "rowsRemoved", "layoutChanged", "modelReset")
+        if self.proxy is proxy:
+            return
         if self.proxy is not None:
-            self.proxy.rowsInserted.disconnect(self._on_proxy_changed)
-            self.proxy.rowsRemoved.disconnect(self._on_proxy_changed)
-            self.proxy.layoutChanged.disconnect(self._on_proxy_changed)
+            for name in signals:
+                getattr(self.proxy, name).disconnect(self._on_proxy_changed)
         self.proxy = proxy
         self.filmstrip.setModel(proxy)
-        proxy.rowsInserted.connect(self._on_proxy_changed)
-        proxy.rowsRemoved.connect(self._on_proxy_changed)
-        proxy.layoutChanged.connect(self._on_proxy_changed)
-        self._preview_cache.clear()  # a different folder/filter means a different set of paths
+        for name in signals:
+            getattr(proxy, name).connect(self._on_proxy_changed)
 
     def open_photo(self, photo_id: int):
         if self.proxy is None:
@@ -498,12 +559,44 @@ class PhotoViewerView(QWidget):
         self.type_filter.blockSignals(False)
 
     def _on_proxy_changed(self, *args):
-        # The set of visible photos changed (filter/sort/scan) while the
-        # viewer is open -- clamp back onto a valid row rather than showing
-        # stale data for a row that may no longer mean the same photo.
+        if self.isVisible():
+            self._proxy_change_timer.start()
+
+    def _apply_proxy_change(self):
+        """The set/order of visible photos changed while the viewer is open
+        (filter, sort, scan, delete). Stay on the same photo if it's still
+        in the set -- a filter change used to leave the viewer on whatever
+        photo happened to land at the old row number instead."""
+        if self.proxy is None or not self.isVisible():
+            return
         self._update_filmstrip_item_width()
-        if self._current_row >= 0:
-            self._show_row(self._current_row)
+        row = self._row_of(self._current_id)
+        if row is None:
+            # e.g. viewing DSC0001.ARW and switching to "JPEG only": land on
+            # DSC0001.JPG, the same shot, rather than an unrelated photo.
+            row = self._row_of_sibling(self._current_path)
+        self._show_row(row if row is not None else self._current_row)
+
+    def _row_of(self, photo_id):
+        if photo_id is None or self.proxy is None:
+            return None
+        if 0 <= self._current_row < self.proxy.rowCount():
+            if self.proxy.index(self._current_row, 0).data(PhotoListModel.PhotoIdRole) == photo_id:
+                return self._current_row
+        for row in range(self.proxy.rowCount()):
+            if self.proxy.index(row, 0).data(PhotoListModel.PhotoIdRole) == photo_id:
+                return row
+        return None
+
+    def _row_of_sibling(self, path):
+        if not path or self.proxy is None:
+            return None
+        target = Path(path)
+        for row in range(self.proxy.rowCount()):
+            other = Path(self.proxy.index(row, 0).data(PhotoListModel.PathRole))
+            if other.stem == target.stem and other.parent == target.parent:
+                return row
+        return None
 
     def _current_photo_id(self):
         if self.proxy is None or not (0 <= self._current_row < self.proxy.rowCount()):
@@ -516,81 +609,60 @@ class PhotoViewerView(QWidget):
             self.backRequested.emit()
             return
         row = max(0, min(row, total - 1))
-        self._current_row = row
         index = self.proxy.index(row, 0)
+        photo_id = index.data(PhotoListModel.PhotoIdRole)
         path = index.data(PhotoListModel.PathRole)
         name = index.data(PhotoListModel.NameRole) or ""
         rating = index.data(PhotoListModel.RatingRole) or 0
+        same_photo = photo_id == self._current_id and path == self._current_path
+        self._current_row = row
+        self._current_id = photo_id
+        self._current_path = path
 
         self.position_label.setText(f"{name}    ·    {row + 1} of {total}")
         self.rating_widget.set_rating(rating)
-        self._populate_exif(path)
         self.scrub_bar.set_fraction(row / (total - 1) if total > 1 else 0.0)
-
         self.filmstrip.setCurrentIndex(index)
         self.filmstrip.scrollTo(index, QListView.ScrollHint.EnsureVisible)
+        if same_photo:
+            return  # e.g. a filter change that kept this photo: nothing to reload
 
-        self._load_generation += 1
+        self._populate_exif(path)
+
         cached = self._preview_cache.get(path)
         if cached is not None:
             self._preview_cache.move_to_end(path)
             self.image_area.set_pixmap(cached)
-            self._schedule_prefetch()
+        else:
+            # Instant low-res placeholder from the thumbnail already decoded
+            # for the library grid/filmstrip, swapped for the real preview as
+            # soon as it's decoded.
+            thumb = index.data(Qt.ItemDataRole.DecorationRole)
+            self.image_area.set_pixmap(thumb if thumb is not None and not thumb.isNull() else None)
+        self._loader.request(None if cached is not None else path, self._prefetch_paths(row, total))
+
+    def _prefetch_paths(self, row, total):
+        paths = []
+        for offset in PREFETCH_OFFSETS:
+            r = row + offset
+            if 0 <= r < total:
+                p = self.proxy.index(r, 0).data(PhotoListModel.PathRole)
+                if p not in self._preview_cache:
+                    paths.append(p)
+        return paths
+
+    def _on_preview_loaded(self, path, qimage):
+        if qimage is None:
+            if path == self._current_path:
+                self.image_area.set_pixmap(None)
             return
-
-        # Instant low-res placeholder from the thumbnail already decoded for
-        # the library grid/filmstrip -- swapped for the full decode as soon
-        # as it's ready, so a slow RAW demosaic doesn't show a blank/stale
-        # frame while it runs.
-        thumb = index.data(Qt.ItemDataRole.DecorationRole)
-        if thumb is not None and not thumb.isNull():
-            self.image_area.set_pixmap(thumb)
-
-        generation = self._load_generation
-        self._current_load_path = path
-        self._load_thread = _ImageLoadThread(path, generation, self)
-        self._load_thread.loaded.connect(self._on_image_loaded)
-        self._load_thread.start()
-
-    def _on_image_loaded(self, generation: int, pixmap):
-        if generation != self._load_generation:
-            return  # superseded by a newer navigation before this finished
-        if pixmap is not None:
-            self._cache_preview(self._current_load_path, pixmap)
-        self.image_area.set_pixmap(pixmap)
-        self._schedule_prefetch()
-
-    def _cache_preview(self, path, pixmap):
+        pixmap = QPixmap.fromImage(qimage)
         self._preview_cache[path] = pixmap
         self._preview_cache.move_to_end(path)
         while len(self._preview_cache) > PREVIEW_CACHE_SIZE:
             self._preview_cache.popitem(last=False)
-
-    def _schedule_prefetch(self):
-        """Decodes the neighbor photo(s) of the current row in the
-        background, one at a time, so arrow-key navigation across
-        already-visited or about-to-be-visited photos hits the cache
-        instead of paying for a RAW demosaic on every keypress."""
-        if self.proxy is None or (self._prefetch_thread is not None and self._prefetch_thread.isRunning()):
-            return
-        total = self.proxy.rowCount()
-        for neighbor_row in (self._current_row + 1, self._current_row - 1):
-            if not (0 <= neighbor_row < total):
-                continue
-            path = self.proxy.index(neighbor_row, 0).data(PhotoListModel.PathRole)
-            if path in self._preview_cache or path == self._current_load_path:
-                continue
-            thread = _ImageLoadThread(path, 0, self)
-            thread.loaded.connect(lambda _gen, pixmap, path=path: self._on_prefetched(path, pixmap))
-            self._prefetch_thread = thread
-            thread.start()
-            return
-
-    def _on_prefetched(self, path, pixmap):
-        if pixmap is not None:
-            self._cache_preview(path, pixmap)
-        self._prefetch_thread = None
-        self._schedule_prefetch()  # chain onto the other neighbor, if it's still missing
+        if path == self._current_path:
+            self.image_area.set_pixmap(pixmap)
 
     def _populate_exif(self, path):
         """Rebuilds the icon-row EXIF list for the current photo -- which
@@ -651,9 +723,10 @@ class PhotoViewerView(QWidget):
         photo_id = self._current_photo_id()
         if photo_id is None:
             return
-        self.catalog.set_rating(photo_id, rating)
+        self.catalog.set_rating(photo_id, rating, source="manual")
         index = self.proxy.index(self._current_row, 0)
         self.proxy.setData(index, rating, PhotoListModel.RatingRole)
+        self.proxy.setData(index, "manual" if rating > 0 else None, PhotoListModel.RatingSourceRole)
 
     def _on_edit_clicked(self):
         photo_id = self._current_photo_id()

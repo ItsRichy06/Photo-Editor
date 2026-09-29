@@ -140,6 +140,54 @@ def extract_embedded_preview(path) -> Image.Image | None:
         return img.convert("RGB").copy()
 
 
+def load_display_image(path, max_dim: int) -> Image.Image:
+    """RGB image no larger than max_dim on the long edge, for *looking at* a
+    photo (the viewer), not editing it -- so speed wins over exactness.
+
+    RAW: the camera's embedded JPEG preview, which on this library's Sony
+    ARWs is full-size (6192x4128) and decodes in ~70ms with Pillow's JPEG
+    draft mode, vs ~730ms for the half-size LibRaw demosaic
+    load_preview_float() does. It's the camera's own rendering, so it can
+    differ a little from the editor's RAW decode -- the same trade every
+    culling tool makes. Falls back to a real demosaic if a file's embedded
+    preview is missing or too small to be worth showing.
+    JPEG/TIFF: draft mode lets libjpeg decode straight at 1/2-1/8 scale."""
+    path = str(path)
+    img = None
+    if is_raw(path):
+        try:
+            with rawpy.imread(path) as raw:
+                thumb = raw.extract_thumb()
+                flip = raw.sizes.flip
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                img = Image.open(io.BytesIO(thumb.data))
+                img.draft("RGB", (max_dim, max_dim))
+                img = _apply_libraw_flip(img.convert("RGB"), flip)
+                if max(img.size) < min(max_dim, 1600) // 2:
+                    img = None
+        except (rawpy.LibRawError, OSError):
+            img = None
+        if img is None:
+            arr = load_preview_float(path, max_dim=max_dim)
+            img = Image.fromarray((np.clip(arr, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8))
+    else:
+        with Image.open(path) as src:
+            if src.format == "JPEG":
+                src.draft("RGB", (max_dim, max_dim))
+            # exif_transpose() only when actually rotated -- it copies the
+            # whole image and re-serializes the EXIF block even when there's
+            # nothing to do, which measured at ~100ms of a ~280ms JPEG load.
+            if src.getexif().get(0x0112, 1) != 1:
+                img = ImageOps.exif_transpose(src).convert("RGB")
+            else:
+                img = src.convert("RGB")
+    longest = max(img.size)
+    if longest > max_dim:
+        scale = max_dim / longest
+        img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), Image.BILINEAR)
+    return img
+
+
 def _rational_to_float(value):
     """EXIF rational values come back as (numerator, denominator) tuples (or
     occasionally an IFDRational/plain number depending on Pillow version)."""
