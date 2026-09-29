@@ -125,3 +125,23 @@ try {
 Write-Host "Published Photo Editor $Version -> $feedDir"
 Write-Host "  installer: $installerName ($([math]::Round((Get-Item $installer).Length / 1GB, 2)) GB)"
 Write-Host "  sha256:    $sha256"
+
+# Mirror the release notes to the app portal, which renders them at
+# https://nas.taila13a0a.ts.net/apps/photo-editor. The portal reads this copy, not
+# the one in this repo -- the NAS cannot see this machine's filesystem -- so
+# without this step the site keeps showing whatever the notes said the last
+# time someone copied them by hand. (It sat on 1.9.0 for three weeks that way
+# while 1.14.1 downloaded fine.)
+#
+# Deliberately non-fatal and last: the installer and the update manifest are
+# already published by this point, so a release that succeeded must not be
+# reported as failed just because the portal copy did not land. The version
+# the site *shows* is read from the installer's filename, not from here, so
+# the worst case is notes that lag by one release.
+$portalNotes = "\\NAS\SSD\FrontEnd\apps\photo-editor\CHANGELOG.md"
+try {
+    Copy-Item $changelog $portalNotes -Force -ErrorAction Stop
+    Write-Host "  notes:     -> $portalNotes"
+} catch {
+    Write-Warning "Portal changelog copy failed ($portalNotes): $($_.Exception.Message) -- the release itself published fine; re-copy it by hand to update the site's notes."
+}
