@@ -18,6 +18,15 @@ git commits.
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-09-29
+### Added
+- The library now remembers whether a rating was set by hand or by
+  Auto-Rate Unrated, and a "Rated by: All / My ratings / Auto-rated"
+  filter to tell them apart -- useful for pulling up everything Auto-Rate
+  touched for a second look without mixing in ratings you set yourself.
+  Existing ratings from before this predate the distinction and show under
+  neither specific filter until re-rated.
+
 ## [1.15.0] - 2026-09-28
 ### Added
 - A full-size photo viewer ("loupe" view): double-click a photo to open it
