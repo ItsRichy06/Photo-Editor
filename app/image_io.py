@@ -1,4 +1,4 @@
-"""Unified image loading/saving for JPEG/JPG and Sony ARW (RAW).
+"""Unified image loading/saving for JPEG/JPG and RAW (Sony ARW, Canon CR2).
 
 All editing/export works on float32 RGB arrays in the [0, 1] range so the same
 processing pipeline (app/processing.py) applies to both formats. RAW files are
@@ -14,7 +14,11 @@ import numpy as np
 import rawpy
 from PIL import Image, ExifTags, ImageOps, TiffImagePlugin
 
-RAW_EXTENSIONS = {".arw"}
+# Every RAW path goes through rawpy/LibRaw (which reads both natively) plus
+# the generic TIFF/IFD EXIF walk in _read_tiff_exif_tags (CR2 is TIFF-based
+# like ARW), so a format only needs adding here once it's been checked
+# end-to-end against real files from that camera.
+RAW_EXTENSIONS = {".arw", ".cr2"}
 # .tif/.tiff included so a file exported from elsewhere (e.g. another
 # stacking/editing tool's TIFF output) can be reopened here for further
 # editing -- Image.open() already handles TIFF natively via Pillow, same
@@ -205,9 +209,15 @@ def _rational_to_float(value):
         return None
 
 
+def _clean_exif_text(value) -> str:
+    # Canon pads fixed-size EXIF strings with NULs (e.g. LensModel
+    # "EF-S18-55mm f/3.5-5.6 III" followed by 40+ \x00 on an EOS 1100D CR2).
+    return str(value or "").split("\x00", 1)[0].strip()
+
+
 def _combine_make_model(make, model) -> str | None:
-    make = (make or "").strip()
-    model = (model or "").strip()
+    make = _clean_exif_text(make)
+    model = _clean_exif_text(model)
     if not model:
         return make or None
     if not make or model.lower().startswith(make.lower()):
