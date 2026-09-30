@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 DEFAULT_DB_NAME = "catalog.db"
+BACKUPS_TO_KEEP = 7
 
 
 def app_data_dir() -> Path:
@@ -33,9 +34,39 @@ class Catalog:
         except Exception as exc:
             if not self._is_malformed_error(exc):
                 raise
-            print(f"[catalog] 'database disk image is malformed' at startup -- recovering and retrying: {exc}")
+            print(f"[catalog] 'database disk image is malformed' at startup -- reconnecting and retrying: {exc}")
             self._recover_from_malformed()
             self._init_schema()
+        self._daily_backup()
+
+    def _daily_backup(self, keep: int = BACKUPS_TO_KEEP):
+        """At most once a day, a consistent copy of the catalog (SQLite's
+        own online-backup API, safe while in use) into catalog_backups/,
+        keeping the newest `keep`. Ratings and edits exist nowhere but this
+        file, and it has hit trouble three times. Skipped if the catalog
+        fails a quick integrity check, so a damaged copy never rotates the
+        good ones out. Never allowed to stop the app from starting."""
+        try:
+            backup_dir = self.db_path.parent / "catalog_backups"
+            dest = backup_dir / f"catalog-{time.strftime('%Y%m%d')}.db"
+            if dest.exists():
+                return
+            with self._lock:
+                if self.conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    print("[catalog] quick_check failed -- skipping today's backup to keep older good ones")
+                    return
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                tmp = dest.with_suffix(".tmp")
+                target = sqlite3.connect(str(tmp))
+                try:
+                    self.conn.backup(target)
+                finally:
+                    target.close()
+                tmp.replace(dest)
+            for old in sorted(backup_dir.glob("catalog-*.db"))[:-keep]:
+                old.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001 -- a failed backup must never block startup
+            print(f"[catalog] daily backup failed: {exc}")
 
     def _connect(self):
         # timeout=30: how long a write waits for another connection's lock to
@@ -49,40 +80,46 @@ class Catalog:
         # restarting the app.
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
-        # WAL + NORMAL sync: commits no longer force a full fsync-per-row, which
-        # is what made scanning a folder of thousands of photos crawl.
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        # Rollback journal, not WAL. WAL mode kept hitting "database disk
+        # image is malformed" on real interactive launches (never in scripted
+        # replays of the same scan on a copy of the same file, which always
+        # passed integrity_check) -- the signature of a damaged WAL index,
+        # the memory-mapped -shm file, most likely disturbed by something
+        # outside the app. A rollback journal has no -shm at all. Measured on
+        # the real 21k-photo catalog: the bulk folder-scan transaction is the
+        # same speed (46ms vs 50ms); a single rating commit goes from ~0ms to
+        # ~5ms, still imperceptible. Switching an existing WAL database
+        # checkpoints any pending WAL content into the main file first, so
+        # nothing is lost on upgrade. If another connection (e.g. a second
+        # instance) still holds the file in WAL mode the switch fails with
+        # "database is locked" -- that must not stop the app starting, so it
+        # carries on in WAL until the next start instead.
+        self.conn.execute("PRAGMA busy_timeout=2000")
+        try:
+            mode = self.conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            mode = f"unchanged ({exc})"
+        if mode.lower() != "delete":
+            print(f"[catalog] couldn't switch to journal_mode=DELETE: {mode} -- database in use elsewhere? continuing")
+        self.conn.execute("PRAGMA busy_timeout=30000")
         self.conn.execute("PRAGMA synchronous=NORMAL")
 
     def _recover_from_malformed(self):
-        """Close, clear the WAL-mode sidecar files (-wal/-shm), and reconnect.
+        """Reconnect after a "database disk image is malformed" error and let
+        the caller retry once.
 
-        Confirmed live, repeatedly, on a real installed copy: "database disk
-        image is malformed" during an ordinary write, even though
-        PRAGMA integrity_check on the same file moments before and after
-        always reports "ok" -- this is WAL-mode shared-memory-index
-        corruption, not actual page-data corruption (never reproduced from
-        any scripted launch, only real interactive ones, which points at
-        something like antivirus real-time scanning interfering with
-        SQLite's memory-mapped -shm file, though the exact trigger was never
-        pinned down). The -wal file only ever holds not-yet-checkpointed
-        writes; on a sync=NORMAL/WAL setup those are the most recent
-        uncommitted ones, so this can lose a just-in-flight write, but the
-        alternative -- the catalog silently refusing to open at all for the
-        rest of the session, exactly what this replaced -- is worse. Deleting
-        and letting SQLite regenerate both fresh has reliably recovered every
-        single time this was hit and fixed by hand before this method
-        existed.
+        This used to delete the -wal and -shm files before reconnecting.
+        That could silently throw away committed changes (ratings, flags,
+        edits): in WAL mode a commit lives only in the -wal file until it's
+        checkpointed into the main file. No sidecar file is ever deleted here
+        now -- in rollback-journal mode a leftover -journal file is what
+        SQLite needs to undo a half-finished write, so deleting it would
+        risk real corruption.
         """
         try:
             self.conn.close()
         except Exception:
             pass
-        for suffix in ("-wal", "-shm"):
-            try:
-                Path(str(self.db_path) + suffix).unlink(missing_ok=True)
-            except OSError:
-                pass
         self._connect()
 
     def _is_malformed_error(self, exc: Exception) -> bool:
@@ -151,16 +188,16 @@ class Catalog:
         committing once per file (with fsync) for thousands of photos is the
         main reason a big library scan used to crawl.
 
-        Retries once, recovering via _recover_from_malformed(), if this hits
-        "database disk image is malformed" -- confirmed live as this exact
-        call's failure mode; see _recover_from_malformed()'s docstring.
+        Retries once after reconnecting if this hits "database disk image is
+        malformed" -- confirmed live as this exact call's failure mode under
+        the old WAL mode; see _connect() and _recover_from_malformed().
         """
         try:
             return self._get_or_create_photos_bulk_once(paths)
         except Exception as exc:
             if not self._is_malformed_error(exc):
                 raise
-            print(f"[catalog] 'database disk image is malformed' during folder scan -- recovering and retrying: {exc}")
+            print(f"[catalog] 'database disk image is malformed' during folder scan -- reconnecting and retrying: {exc}")
             with self._lock:
                 self._recover_from_malformed()
             return self._get_or_create_photos_bulk_once(paths)
