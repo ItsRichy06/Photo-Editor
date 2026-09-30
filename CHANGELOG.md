@@ -18,6 +18,17 @@ git commits.
 
 ## [Unreleased]
 
+## [1.16.3] - 2026-09-30
+### Fixed
+- "Scan Failed -- database disk image is malformed" could still appear
+  after 1.16.2. The catalog file is never actually damaged when this
+  happens -- it reads as damaged for a moment, then fine -- so the folder
+  scan now retries for several seconds instead of once, which should get
+  past it without a dialog. The underlying cause is still unknown, so
+  each occurrence is now recorded (with what the catalog file looked like
+  at that instant) in `%LOCALAPPDATA%\PhotoEditor\logs\catalog.log`, and
+  the dialog says where to find it if it still appears.
+
 ## [1.16.2] - 2026-09-30
 ### Fixed
 - "Scan Failed -- database disk image is malformed" could come back even
