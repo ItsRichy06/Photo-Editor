@@ -836,7 +836,8 @@ class LibraryView(QWidget):
             "Scan Failed",
             f"Couldn't finish scanning this folder:\n\n{error}\n\n"
             "This is usually transient (e.g. another process briefly using the photo catalog). "
-            "Try Open Folder again -- your ratings and edits are untouched either way.",
+            "Try Open Folder again -- your ratings and edits are untouched either way.\n\n"
+            f"Details were saved to {self.catalog.db_path.parent / 'logs' / 'catalog.log'}",
         )
 
     # ----------------------------------------------------------- deleting

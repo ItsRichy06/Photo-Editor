@@ -34,7 +34,7 @@ class Catalog:
         except Exception as exc:
             if not self._is_malformed_error(exc):
                 raise
-            print(f"[catalog] 'database disk image is malformed' at startup -- reconnecting and retrying: {exc}")
+            self._log_malformed(exc, "startup")
             self._recover_from_malformed()
             self._init_schema()
         self._daily_backup()
@@ -188,19 +188,76 @@ class Catalog:
         committing once per file (with fsync) for thousands of photos is the
         main reason a big library scan used to crawl.
 
-        Retries once after reconnecting if this hits "database disk image is
-        malformed" -- confirmed live as this exact call's failure mode under
-        the old WAL mode; see _connect() and _recover_from_malformed().
+        "database disk image is malformed" is retried with a fresh
+        connection, backing off over ~8s. It has hit this exact call on real
+        launches (twice on 2026-09-30, once already in rollback-journal mode)
+        while every check of the file itself -- before, straight after, and
+        replaying the same scan on copies -- found nothing wrong: the file
+        looks damaged for a moment, then doesn't. A single immediate retry
+        wasn't enough. Every occurrence is written to logs/catalog.log with
+        what the file looked like at that instant, since the cause is still
+        unknown and the app otherwise has nowhere to report it (pythonw has
+        no console).
         """
+        delays = (0.5, 1.0, 2.0, 4.0)
+        for attempt in range(len(delays) + 1):
+            try:
+                result = self._get_or_create_photos_bulk_once(paths)
+                if attempt:
+                    self._log_event(f"folder scan succeeded on retry {attempt}")
+                return result
+            except Exception as exc:
+                if not self._is_malformed_error(exc):
+                    raise
+                self._log_malformed(exc, f"folder scan, attempt {attempt + 1} of {len(delays) + 1}")
+                if attempt == len(delays):
+                    raise
+                time.sleep(delays[attempt])
+                with self._lock:
+                    self._recover_from_malformed()
+
+    def _log_event(self, message: str):
+        """Appends to logs/catalog.log next to the catalog, keeping it under
+        ~1MB. Best-effort: logging must never itself break the catalog."""
         try:
-            return self._get_or_create_photos_bulk_once(paths)
-        except Exception as exc:
-            if not self._is_malformed_error(exc):
-                raise
-            print(f"[catalog] 'database disk image is malformed' during folder scan -- reconnecting and retrying: {exc}")
-            with self._lock:
-                self._recover_from_malformed()
-            return self._get_or_create_photos_bulk_once(paths)
+            log_dir = self.db_path.parent / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "catalog.log"
+            if log_path.exists() and log_path.stat().st_size > 1_000_000:
+                log_path.replace(log_dir / "catalog.log.old")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} {message}\n")
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"[catalog] {message}")
+
+    def _log_malformed(self, exc: Exception, context: str):
+        """Records a "malformed" error with a snapshot of the file at that
+        instant: whether it checks out through the live connection and
+        through a brand-new one, its size/mtime, and any sidecar files."""
+        import traceback
+
+        lines = [f"'database disk image is malformed' during {context}: {exc}", traceback.format_exc().rstrip()]
+        live = getattr(self, "conn", None)  # may not exist yet if connecting itself failed
+        for label, conn in ((("live connection", live),) if live is not None else ()) + (("fresh connection", None),):
+            try:
+                c = conn if conn is not None else sqlite3.connect(str(self.db_path), timeout=5)
+                try:
+                    result = [tuple(r) for r in c.execute("PRAGMA quick_check(5)").fetchall()]
+                    lines.append(f"  quick_check via {label}: {result}")
+                finally:
+                    if conn is None:
+                        c.close()
+            except Exception as e2:  # noqa: BLE001
+                lines.append(f"  quick_check via {label} raised {type(e2).__name__}: {e2}")
+        try:
+            st = self.db_path.stat()
+            lines.append(f"  file: {st.st_size} bytes, modified {time.strftime('%H:%M:%S', time.localtime(st.st_mtime))}")
+            sidecars = [p.name for p in self.db_path.parent.glob(self.db_path.name + "-*")]
+            lines.append(f"  sidecar files: {sidecars or 'none'}")
+        except OSError as e3:
+            lines.append(f"  stat failed: {e3}")
+        self._log_event("\n".join(lines))
 
     def _get_or_create_photos_bulk_once(self, paths: list[str]) -> dict:
         resolved = [str(Path(p).resolve()) for p in paths]
