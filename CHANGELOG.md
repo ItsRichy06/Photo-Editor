@@ -18,6 +18,20 @@ git commits.
 
 ## [Unreleased]
 
+## [1.16.2] - 2026-09-30
+### Fixed
+- "Scan Failed -- database disk image is malformed" could come back even
+  with 1.13.2's automatic recovery, leaving newly added photos out of the
+  library. The catalog now uses SQLite's classic rollback journal instead
+  of WAL mode, which removes the shared-memory index file this error
+  comes from. The catalog file itself was never damaged.
+- The old automatic recovery deleted SQLite's -wal file, which could
+  silently discard recent ratings or edits that hadn't been written into
+  the main file yet. It now just reconnects and retries, deleting nothing.
+### Added
+- A daily safety backup of the catalog (ratings, flags, edits) in
+  `%LOCALAPPDATA%\PhotoEditor\catalog_backups`, keeping the last 7 days.
+
 ## [1.16.1] - 2026-09-29
 ### Fixed
 - The photo viewer could crash after a few photos and stuttered while
