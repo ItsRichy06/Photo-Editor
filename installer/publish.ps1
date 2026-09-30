@@ -29,7 +29,16 @@
 # installer doesn't look like this app's -- a hash check alone doesn't
 # protect against reading the wrong app's (individually valid, correctly-
 # hashed) feed.
-param([Parameter(Mandatory = $true)][string]$Version)
+# -FeedDir / -PortalNotes exist so the publish logic can be tested against a
+# local folder; normal runs leave them at the real NAS locations.
+param(
+    [Parameter(Mandatory = $true)][string]$Version,
+    # Keep this in sync with UPDATE_FEED_DIR in app/updater.py -- a UNC path,
+    # not a drive letter, for the same reason: Z: is just how this machine
+    # happens to have \\NAS\FamilyStorage mapped right now.
+    [string]$FeedDir = "\\NAS\FamilyStorage\shares\Personal\fotoeditor",
+    [string]$PortalNotes = "\\NAS\SSD\FrontEnd\apps\photo-editor\CHANGELOG.md"
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -37,10 +46,33 @@ $repo = Split-Path $PSScriptRoot -Parent
 $installer = Join-Path $repo "installer_output\PhotoEditor-Setup.exe"
 $versionFile = Join-Path $repo "app\version.py"
 $changelog = Join-Path $repo "CHANGELOG.md"
-# Keep this in sync with UPDATE_FEED_DIR in app/updater.py -- a UNC path,
-# not a drive letter, for the same reason: Z: is just how this machine
-# happens to have \\NAS\FamilyStorage mapped right now.
-$feedDir = "\\NAS\FamilyStorage\shares\Personal\fotoeditor"
+$feedDir = $FeedDir
+
+function Copy-OverwritingStale([string]$Source, [string]$Dest) {
+    # For files whose name is fixed (the manifest, the portal's notes), so
+    # the installer's fresh-timestamped-name trick isn't available. When the
+    # share refuses to overwrite the existing copy (see the ownership note
+    # below), rename it aside -- a rename only needs rights on the folder,
+    # which this share grants -- and write a fresh file under the real name.
+    # If even that fails, put the old copy back rather than leave nothing
+    # there. Returns the aside name, or $null if a plain overwrite worked.
+    try {
+        Copy-Item $Source $Dest -Force -ErrorAction Stop
+        return $null
+    } catch {
+        if (-not (Test-Path $Dest)) { throw }
+        $aside = "$(Split-Path $Dest -Leaf).replaced-$(Get-Date -Format 'yyyyMMddHHmmss')"
+        Write-Host "Couldn't overwrite $Dest ($($_.Exception.Message)) -- renaming the old copy to $aside and retrying ..."
+        Rename-Item $Dest $aside -ErrorAction Stop
+        try {
+            Copy-Item $Source $Dest -ErrorAction Stop
+        } catch {
+            Rename-Item (Join-Path (Split-Path $Dest -Parent) $aside) (Split-Path $Dest -Leaf) -ErrorAction SilentlyContinue
+            throw
+        }
+        return $aside
+    }
+}
 
 if (-not (Test-Path $installer)) {
     throw "Installer not found: $installer -- build it first (ISCC.exe installer\PhotoEditor.iss)"
@@ -61,8 +93,11 @@ $sha256 = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
 # This share has a confirmed, recurring quirk (hit repeatedly across this
 # project's history, not a one-off): a file already there can become
 # unwritable to a *later* write attempt, even one from the very same
-# session that created it -- ownership assigned on create apparently
-# doesn't reliably stay writable afterward. A version-suffixed fallback
+# session that created it. Cause, confirmed 2026-09-30 by reading the ACLs:
+# every file written here ends up owned by the NAS's guest account (RID
+# 501) rather than the connecting user, and a later session can't
+# overwrite it -- while the folder itself grants Everyone full control, so
+# renaming or deleting a file inside it still works. A version-suffixed fallback
 # name isn't enough on its own -- confirmed live, re-running this script
 # after a failed attempt hit the SAME problem on that fallback name, since
 # it had already been claimed (and already gone stale) by the failed
@@ -111,20 +146,23 @@ $manifestPath = Join-Path $env:TEMP $manifestName
 # when it's this easy to avoid at the source.
 [System.IO.File]::WriteAllText($manifestPath, $manifest, (New-Object System.Text.UTF8Encoding $false))
 
+# Unlike the installer, the manifest's filename is NOT dynamic -- the client
+# always looks for exactly this name -- so a blocked overwrite is handled by
+# renaming the stale one aside instead (hit for real publishing 1.16.2).
 try {
-    Copy-Item $manifestPath (Join-Path $feedDir $manifestName) -Force -ErrorAction Stop
+    $manifestAside = Copy-OverwritingStale $manifestPath (Join-Path $feedDir $manifestName)
 } catch {
-    # Unlike the installer, the manifest's filename is NOT dynamic -- the
-    # client always looks for exactly this name -- so there's no automatic
-    # fallback available here. If this share's write-once quirk ever hits
-    # this specific file, it has to be resolved by hand (delete the stale
-    # copy on the share, or ask whoever owns it to).
     throw "Could not write $manifestName to $feedDir ($($_.Exception.Message)) -- the installer copy above succeeded, but the update feed itself did NOT get published, so no installed copy will see $Version as available. Clear whatever's blocking $feedDir\$manifestName and re-run."
+}
+$published = Get-Content (Join-Path $feedDir $manifestName) -Raw | ConvertFrom-Json
+if ($published.version -ne $Version -or $published.installer -ne $installerName -or $published.sha256 -ne $sha256) {
+    throw "$manifestName on the share doesn't read back as what was just written -- check $feedDir by hand."
 }
 
 Write-Host "Published Photo Editor $Version -> $feedDir"
 Write-Host "  installer: $installerName ($([math]::Round((Get-Item $installer).Length / 1GB, 2)) GB)"
 Write-Host "  sha256:    $sha256"
+if ($manifestAside) { Write-Host "  (previous manifest kept as $manifestAside)" }
 
 # Mirror the release notes to the app portal, which renders them at
 # https://nas.taila13a0a.ts.net/apps/photo-editor. The portal reads this copy, not
@@ -138,10 +176,10 @@ Write-Host "  sha256:    $sha256"
 # reported as failed just because the portal copy did not land. The version
 # the site *shows* is read from the installer's filename, not from here, so
 # the worst case is notes that lag by one release.
-$portalNotes = "\\NAS\SSD\FrontEnd\apps\photo-editor\CHANGELOG.md"
+$portalNotes = $PortalNotes
 try {
-    Copy-Item $changelog $portalNotes -Force -ErrorAction Stop
-    Write-Host "  notes:     -> $portalNotes"
+    $notesAside = Copy-OverwritingStale $changelog $portalNotes
+    Write-Host "  notes:     -> $portalNotes$(if ($notesAside) { " (previous kept as $notesAside)" })"
 } catch {
     Write-Warning "Portal changelog copy failed ($portalNotes): $($_.Exception.Message) -- the release itself published fine; re-copy it by hand to update the site's notes."
 }
