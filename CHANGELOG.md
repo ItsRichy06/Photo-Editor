@@ -18,6 +18,16 @@ git commits.
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-09-30
+### Added
+- Canon CR2 RAW support: CR2 files show up in the library (and under
+  "RAW only"), open in the viewer and the editor, and work with
+  Auto-Rate and Stack Photos, the same as Sony ARW. Tested on real files
+  from a Canon EOS 1100D.
+### Fixed
+- Lens names from Canon cameras no longer show trailing junk characters
+  in the shooting info.
+
 ## [1.16.3] - 2026-09-30
 ### Fixed
 - "Scan Failed -- database disk image is malformed" could still appear
