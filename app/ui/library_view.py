@@ -491,7 +491,9 @@ class AutoRateThread(QThread):
 
     progress = Signal(int, int)  # groups done, groups total
     photo_rated = Signal(int, int)  # photo_id, rating
-    finished_rating = Signal(int)  # total photo ids rated (both pair members counted)
+    # rated photo ids (both pair members counted), photos that couldn't be
+    # read, how many of those no longer exist on disk, and one example error
+    finished_rating = Signal(int, int, int, str)
 
     def __init__(self, unrated_photos: list, catalog):
         super().__init__()
@@ -510,6 +512,9 @@ class AutoRateThread(QThread):
         total = len(groups)
         done = 0
         rated_count = 0
+        failed = 0
+        missing = 0
+        example_error = ""
         for members in groups.values():
             if self._stop:
                 break
@@ -517,7 +522,15 @@ class AutoRateThread(QThread):
             try:
                 rating = quality.assess_photo(representative["path"])
             except Exception as exc:  # noqa: BLE001 - keep going past a bad file
+                # Counted and reported, not just printed: the app runs under
+                # pythonw with no console, so a pass where every photo failed
+                # (confirmed: the folder had been renamed after it was opened)
+                # used to end in a bare "Rated 0 photos" with no reason given.
                 print(f"[auto-rate] failed to assess {representative['path']}: {exc}")
+                failed += len(members)
+                missing += sum(1 for m in members if not os.path.exists(m["path"]))
+                if not example_error:
+                    example_error = f"{Path(representative['path']).name}: {exc}"
                 done += 1
                 self.progress.emit(done, total)
                 continue
@@ -528,7 +541,7 @@ class AutoRateThread(QThread):
             done += 1
             self.progress.emit(done, total)
 
-        self.finished_rating.emit(rated_count)
+        self.finished_rating.emit(rated_count, failed, missing, example_error)
 
 
 class LibraryView(QWidget):
@@ -1017,16 +1030,25 @@ class LibraryView(QWidget):
     def _on_photo_rated(self, photo_id: int, rating: int):
         self.model.set_rating_by_id(photo_id, rating, source="auto")
 
-    def _on_auto_rate_finished(self, rated_count: int):
+    def _on_auto_rate_finished(self, rated_count: int, failed: int = 0, missing: int = 0, example_error: str = ""):
         if self._auto_rate_progress is not None:
             self._auto_rate_progress.close()
             self._auto_rate_progress = None
-        QMessageBox.information(
-            self,
-            "Auto-Rate Unrated",
-            f"Rated {rated_count} photo{'s' if rated_count != 1 else ''}. These are rough, automatic "
-            "ratings -- review and adjust any that look off.",
-        )
+        message = f"Rated {rated_count} photo{'s' if rated_count != 1 else ''}."
+        if rated_count:
+            message += " These are rough, automatic ratings -- review and adjust any that look off."
+        if failed:
+            message += f"\n\n{failed} photo{'s' if failed != 1 else ''} couldn't be read"
+            if missing == failed:
+                message += (
+                    " -- the files are no longer where the library last saw them. If the folder was "
+                    "renamed or moved after opening it, use Open Folder to reload it and try again."
+                )
+            else:
+                message += f", for example:\n{example_error}"
+            QMessageBox.warning(self, "Auto-Rate Unrated", message)
+            return
+        QMessageBox.information(self, "Auto-Rate Unrated", message)
 
     def _on_double_clicked(self, index):
         if not index.isValid():
