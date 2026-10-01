@@ -12,7 +12,10 @@
 ; install won't have it.
 
 #define MyAppName "Photo Editor"
-#define MyAppVersion "1.0"
+#ifndef MyAppVersion
+  ; installer\build.ps1 passes the real one: /DMyAppVersion=<app\version.py>
+  #define MyAppVersion "1.0"
+#endif
 #define MyAppPublisher "Photo Editor"
 
 [Setup]
