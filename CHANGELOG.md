@@ -25,6 +25,16 @@ git commits.
   this reliably: the two overlap heavily. The first time a folder is
   opened after updating, the app reads every photo's dimensions once
   (a few extra seconds on a very large folder); after that it's instant.
+- Small updates: most releases now come as a ~2 MB "update only" package
+  instead of the full ~2.7 GB installer, whenever the bundled Python
+  runtime hasn't changed (it rarely does). It checks the installed
+  runtime itself and refuses rather than install on a mismatched one.
+### Changed
+- Automatic updates now come from the app portal over HTTPS instead of a
+  home-network file share, so they also work away from home. The app
+  picks the small package when it can, resumes an interrupted download,
+  and only offers an update once the download is verified. Installs from
+  before this version need the full installer one more time.
 
 ## [1.17.1] - 2026-10-01
 ### Fixed
