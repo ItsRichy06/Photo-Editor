@@ -34,6 +34,9 @@ import threading
 
 import numpy as np
 
+from . import processing
+from .quality import CLIP_PIXEL_THRESHOLD
+
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # Plenty of resolution for a global tone/color judgment; keeps inference
@@ -208,6 +211,97 @@ def _parse_response(text: str) -> tuple[dict, str]:
     return adjustments, reasoning
 
 
+# How many more percentage points of the photo the suggestion is allowed to
+# push into near-black/near-white than the original already had, before
+# exposure/contrast/highlights get scaled back. Confirmed live: the model
+# suggested +2.00 EV and +30 contrast against a photo that measured mean
+# luminance 0.510 with ~0% shadow/highlight clipping -- a textbook-correct
+# exposure -- and its own stated reasoning didn't reference those stats at
+# all, it just narrated a generic "enhanced the details and colors". A
+# vision-language model's own account of its reasoning isn't grounded
+# enough to trust here (same unreliability the module docstring already
+# calls out for reading stats off the image), so this checks the actual
+# pixel data after the fact instead.
+MAX_CLIP_INCREASE_PCT = 5.0
+
+# The fields that can drive a photo toward pure black/white with no built-in
+# ceiling of their own -- unlike highlights/shadows/whites/blacks, which
+# apply_tone_regions() already weights and caps at 0.35 of the adjustable
+# range, exposure is an unbounded multiplier (2**EV) and contrast is an
+# unbounded pivot scale, so either alone can blow out an already-correct
+# exposure with no limit from the pipeline itself. highlights is included
+# because, unlike the other three region tools, a positive value boosts
+# (rather than recovers) the bright end, so it can also be used to blow out
+# highlights specifically.
+_BLOWOUT_PRONE_FIELDS = ("exposure", "contrast", "highlights")
+
+
+def _clip_pcts(image_float: np.ndarray) -> tuple[float, float]:
+    """Uses quality.CLIP_PIXEL_THRESHOLD (0.85), not a literal-0/1 cutoff --
+    confirmed live on the beach photo that prompted this guardrail: pushing
+    +2 EV/+30 contrast through the real pipeline left most of the frame
+    washed out to pale pink/white (mean luminance 0.92) while only 2.2% of
+    pixels actually hit literal 1.0, because contrast's pivot scaling and
+    the final clip-to-[0,1] don't drive every overexposed pixel all the way
+    to the ceiling. At the 0.85 threshold that same result measures 93%
+    highlight-clipped -- the number that actually matches what the photo
+    looks like."""
+    img = np.clip(image_float, 0.0, 1.0)
+    luminance = 0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
+    shadow_pct = float((luminance < (1.0 - CLIP_PIXEL_THRESHOLD)).mean() * 100.0)
+    highlight_pct = float((luminance > CLIP_PIXEL_THRESHOLD).mean() * 100.0)
+    return shadow_pct, highlight_pct
+
+
+def _simulate(image_float: np.ndarray, adjustments: dict, scale: float) -> np.ndarray:
+    """Renders the suggested recipe through the real editing pipeline
+    (app.processing.apply_recipe -- the same code the live preview and
+    export use), with _BLOWOUT_PRONE_FIELDS scaled toward 0 and everything
+    else left at the model's suggested value."""
+    recipe = processing.default_recipe()
+    for key in RECIPE_FIELDS:
+        value = adjustments.get(key, 0.0)
+        recipe[key] = value * scale if key in _BLOWOUT_PRONE_FIELDS else value
+    return processing.apply_recipe(image_float, recipe)
+
+
+def _restrain_blowout(image_float: np.ndarray, adjustments: dict) -> dict:
+    """Scales _BLOWOUT_PRONE_FIELDS back together if applying them as
+    suggested would clip substantially more of the photo than it already
+    was -- simulated against the real pixel data, not the model's own
+    account of what it did. See MAX_CLIP_INCREASE_PCT."""
+    if not any(adjustments.get(key) for key in _BLOWOUT_PRONE_FIELDS):
+        return adjustments
+
+    orig_shadow_pct, orig_highlight_pct = _clip_pcts(image_float)
+
+    def over_budget(scale: float) -> bool:
+        shadow_pct, highlight_pct = _clip_pcts(_simulate(image_float, adjustments, scale))
+        return (
+            highlight_pct > orig_highlight_pct + MAX_CLIP_INCREASE_PCT
+            or shadow_pct > orig_shadow_pct + MAX_CLIP_INCREASE_PCT
+        )
+
+    if not over_budget(1.0):
+        return adjustments
+
+    # Binary search for the largest scale (0..1 of the suggested intensity)
+    # that stays within budget -- 8 steps narrows it to under 0.5% of the
+    # suggested value, far tighter than this triage needs.
+    lo, hi = 0.0, 1.0
+    for _ in range(8):
+        mid = (lo + hi) / 2.0
+        if over_budget(mid):
+            hi = mid
+        else:
+            lo = mid
+
+    restrained = dict(adjustments)
+    for key in _BLOWOUT_PRONE_FIELDS:
+        restrained[key] = adjustments.get(key, 0.0) * lo
+    return restrained
+
+
 def _generate_text(model, processor, pil_img, prompt_text: str) -> str:
     """Two ways to hand the model an image+text prompt: the documented
     apply_chat_template path with tokenize=True and the image embedded
@@ -274,4 +368,5 @@ def suggest_adjustments(image_float: np.ndarray) -> dict:
         return {"adjustments": {key: 0.0 for key in RECIPE_FIELDS}, "reasoning": ""}
 
     adjustments, reasoning = _parse_response(text)
+    adjustments = _restrain_blowout(image_float, adjustments)
     return {"adjustments": adjustments, "reasoning": reasoning}
