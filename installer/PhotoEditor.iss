@@ -26,6 +26,9 @@
 AppId={{3E79FC5F-81EF-4F55-945F-229A4685B1FD}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+; Stamped into the .exe so installer\publish.ps1 can refuse a stale build.
+VersionInfoVersion={#MyAppVersion}
+VersionInfoProductTextVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\PhotoEditor
 DefaultGroupName=Photo Editor

@@ -1,10 +1,13 @@
-"""Tests app/updater.py: version comparison, the happy path (newer version
-found, downloaded, hash-verified), and every failure mode this module is
-specifically designed to survive without disrupting the app -- including
-the exact "manifest names a file that isn't there" bug that silently broke
-updates in the app this was modeled on, and the real cross-app manifest
-collision discovered while first setting this up (see CHANGELOG.md 1.9.0
-and app/updater.py's own comments for the full story).
+"""Tests app/updater.py against a local HTTP server that behaves like the
+portal: /feed/<manifest> and /download/<file> (with HTTP range support).
+
+Covers version comparison, the happy path (newer version found, downloaded,
+hash-verified), choosing the small update-only package vs the full
+installer by runtime fingerprint, resuming an interrupted download, and
+every failure mode this module is designed to survive without disrupting
+the app -- including "manifest names a file that isn't there" (the bug that
+silently broke updates in the app this was modeled on) and a manifest that
+isn't this app's at all (a real collision, see CHANGELOG.md 1.9.0).
 
 Not wired into any CI (this project doesn't have any) -- run directly:
     .venv\\Scripts\\python.exe tests\\test_updater.py
@@ -13,15 +16,15 @@ import sys, os
 from pathlib import Path
 
 # FOTOEDITOR_SRC lets this run against an installed copy's own app/ tree
-# (e.g. C:\Users\...\Programs\PhotoEditor) instead of this source checkout --
-# used throughout this project's testing to verify the actual installed
-# code, not just "does the interpreter agree with the checkout".
+# (e.g. C:\Users\...\Programs\PhotoEditor) instead of this source checkout.
 sys.path.insert(0, os.environ.get("FOTOEDITOR_SRC", str(Path(__file__).resolve().parent.parent)))
 
-import json
 import hashlib
+import json
 import tempfile
+import threading
 import unittest.mock as mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PySide6.QtWidgets import QApplication
 
@@ -35,7 +38,6 @@ assert updater._parse_version("1.9.0") == (1, 9, 0)
 assert updater._parse_version("1.10.0") > updater._parse_version("1.9.0"), (
     "numeric comparison required -- lexicographic would rank 1.9.0 above 1.10.0"
 )
-assert updater._parse_version("1.9.0") == updater._parse_version("1.9.0")
 print("version parsing OK")
 
 # ------------------------------------------------------------- packaged detection
@@ -47,144 +49,219 @@ with mock.patch("sys.executable", r"C:\Users\Richard\Documents\Foto Editor\.venv
 print("packaged-install detection OK")
 
 
-# ------------------------------------------------------------- test harness
-def make_worker_and_feed(tmp_dir):
-    feed_dir = Path(tmp_dir) / "feed"
-    feed_dir.mkdir()
-    updater.UPDATE_FEED_DIR = feed_dir
-    worker = updater._UpdateCheckWorker()
-    events = {"available": None}
-    worker.updateAvailable.connect(lambda v, p, n: events.update(available=(v, p, n)))
-    return worker, feed_dir, events
+# ------------------------------------------------------------- fake portal
+class FakePortal:
+    """Serves files from a temp dir the way the portal does; records every
+    request (path + Range header) so tests can assert what was fetched."""
+
+    def __init__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name) / "releases"
+        self.dir.mkdir()
+        self.requests = []
+        portal = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                portal.requests.append((self.path, self.headers.get("Range")))
+                parts = self.path.strip("/").split("/")
+                if len(parts) != 2 or parts[0] not in ("feed", "download"):
+                    return self.send_error(404)
+                f = portal.dir / parts[1]
+                if not f.is_file():
+                    return self.send_error(404)
+                data = f.read_bytes()
+                rng = self.headers.get("Range")
+                if rng and parts[0] == "download":
+                    start = int(rng.split("=")[1].split("-")[0])
+                    if start >= len(data):
+                        return self.send_error(416)
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{len(data) - 1}/{len(data)}")
+                    data = data[start:]
+                else:
+                    self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{self.server.server_port}"
+        self.downloads = Path(self.tmp.name) / "downloads"
+        self.patches = [
+            mock.patch.object(updater, "FEED_URL", f"{base}/feed/{updater.MANIFEST_NAME}"),
+            mock.patch.object(updater, "DOWNLOAD_URL", f"{base}/download/"),
+            mock.patch.object(updater, "DOWNLOAD_DIR", self.downloads),
+            mock.patch.object(updater, "_installed_runtime_id", lambda: self.installed_runtime),
+        ]
+        self.installed_runtime = None
+
+    def __enter__(self):
+        for p in self.patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in self.patches:
+            p.stop()
+        self.server.shutdown()
+        self.tmp.cleanup()
+
+    def publish(self, name, content):
+        (self.dir / name).write_bytes(content)
+        return hashlib.sha256(content).hexdigest()
+
+    def manifest(self, **fields):
+        (self.dir / updater.MANIFEST_NAME).write_text(json.dumps(fields), encoding="utf-8")
+
+    def check(self):
+        worker = updater._UpdateCheckWorker()
+        events = {"available": None, "finished": False}
+        worker.updateAvailable.connect(lambda v, p, n: events.update(available=(v, p, n)))
+        worker.finished.connect(lambda: events.update(finished=True))
+        worker.run()  # the real entry point: must never raise
+        assert events["finished"], "finished must always fire"
+        return events["available"]
+
+    def downloads_requested(self):
+        return [r for r in self.requests if r[0].startswith("/download/")]
 
 
-def write_manifest(feed_dir, version, installer_name, sha256, notes="test notes"):
-    # Must track the real MANIFEST_NAME, not a hardcoded guess -- a stale
-    # hardcoded name here would make _check() silently find no manifest at
-    # all (the "no manifest present" case), which happens to also satisfy
-    # several other assertions for the wrong reason. Exactly this drifted
-    # out of sync with app/updater.py once already while writing this file.
-    (feed_dir / updater.MANIFEST_NAME).write_text(json.dumps({
-        "version": version, "installer": installer_name, "sha256": sha256, "notes": notes,
-    }), encoding="utf-8")
+FULL = b"full installer bytes " * 1000
+SMALL = b"small update bytes " * 50
 
-
-def write_fake_installer(feed_dir, name, content=b"fake installer bytes"):
-    path = feed_dir / name
-    path.write_bytes(content)
-    return hashlib.sha256(content).hexdigest()
-
-
-# ------------------------------------------------------------- no manifest at all
-print("=== no manifest present ===")
-with tempfile.TemporaryDirectory() as tmp:
-    worker, feed_dir, events = make_worker_and_feed(tmp)
-    worker._check()  # must not raise
-    assert events["available"] is None
+print("=== no manifest published (404) ===")
+with FakePortal() as p:
+    assert p.check() is None
 print("OK: no manifest -> silent no-op")
 
-# ------------------------------------------------------------- already current / older
-print("=== manifest advertises current or older version ===")
-with tempfile.TemporaryDirectory() as tmp:
-    worker, feed_dir, events = make_worker_and_feed(tmp)
-    write_manifest(feed_dir, updater.__version__, "PhotoEditor-Setup.exe", "0" * 64)
-    worker._check()
-    assert events["available"] is None
-print("OK: same version -> no update offered")
+print("=== manifest advertises the current version ===")
+with FakePortal() as p:
+    sha = p.publish("PhotoEditor-Setup-1.0.0.exe", FULL)
+    p.manifest(version=updater.__version__, installer="PhotoEditor-Setup-1.0.0.exe", sha256=sha)
+    assert p.check() is None
+    assert not p.downloads_requested(), "nothing should be downloaded when already current"
+print("OK: same version -> no update offered, nothing downloaded")
 
-# ---------------------------------------- cross-app collision (real, not hypothetical)
-# This actually happened while setting this up: the feed directory turned
-# out to be shared with an unrelated app (Video Editor), whose manifest
-# uses a different schema entirely ("url" instead of "installer"). Confirm
-# reading someone else's manifest degrades safely rather than crashing or,
-# worse, offering to install the wrong app.
-print("=== a different app's manifest entirely sits at the same feed dir ===")
-with tempfile.TemporaryDirectory() as tmp:
-    worker, feed_dir, events = make_worker_and_feed(tmp)
-    (feed_dir / "latest.json").write_text(json.dumps({
-        "version": "1.3.0", "url": "VideoEditorSetup-1.3.0.exe",
-        "sha256": "3d8cc4b5" * 8, "size": 214354089, "releaseDate": "2026-08-28T13:54:21Z",
-    }), encoding="utf-8")
-    updater.MANIFEST_NAME = "latest.json"  # simulate reading the wrong file
-    try:
-        finished = {"fired": False}
-        worker.finished.connect(lambda: finished.update(fired=True))
-        worker.run()  # the real entry point -- must not crash
-    finally:
-        updater.MANIFEST_NAME = "photoeditor-latest.json"
-    assert events["available"] is None, "must never offer to install a different app's installer"
-    assert finished["fired"]
+print("=== a different app's manifest schema (Video Editor's 'url' instead of 'installer') ===")
+with FakePortal() as p:
+    p.manifest(version="99.0.0", url="VideoEditorSetup-1.3.0.exe", sha256="3d8cc4b5" * 8)
+    assert p.check() is None
 print("OK: a schema-mismatched other app's manifest is safely ignored")
 
-# -------------------------- content sanity check (same schema, still not us)
-# A hash check alone would happily "verify" a same-schema manifest for a
-# totally different app -- it only proves the download matches what the
-# manifest says, not that the manifest is actually this app's. This is
-# the check that catches that specific case.
 print("=== same-schema manifest, but the installer name isn't this app's ===")
-with tempfile.TemporaryDirectory() as tmp:
-    worker, feed_dir, events = make_worker_and_feed(tmp)
-    sha = write_fake_installer(feed_dir, "SomeOtherApp-Setup.exe")
-    write_manifest(feed_dir, "99.0.0", "SomeOtherApp-Setup.exe", sha)
-    worker._check()
-    assert events["available"] is None, "must refuse a same-schema manifest for a different app"
-print("OK: content sanity check refuses a non-PhotoEditor installer name")
+with FakePortal() as p:
+    sha = p.publish("SomeOtherApp-Setup.exe", FULL)
+    p.manifest(version="99.0.0", installer="SomeOtherApp-Setup.exe", sha256=sha)
+    assert p.check() is None
+    assert not p.downloads_requested()
+print("OK: refuses a non-PhotoEditor installer name before downloading anything")
 
-# ------------------------------------------------------------- the happy path
-print("=== newer version, installer present, hash matches ===")
-with tempfile.TemporaryDirectory() as tmp:
-    worker, feed_dir, events = make_worker_and_feed(tmp)
-    sha = write_fake_installer(feed_dir, "PhotoEditor-Setup.exe")
-    write_manifest(feed_dir, "99.0.0", "PhotoEditor-Setup.exe", sha, notes="Big fake release")
-    worker._check()
-    assert events["available"] is not None, "expected updateAvailable to fire"
-    version, local_path, notes = events["available"]
-    assert version == "99.0.0"
-    assert notes == "Big fake release"
-    assert Path(local_path).exists(), "verified installer should be copied to local disk"
-    assert Path(local_path).read_bytes() == b"fake installer bytes"
-print("OK: happy path fires updateAvailable with a verified local copy")
+print("=== happy path: install without a runtime fingerprint gets the full installer ===")
+with FakePortal() as p:
+    full_sha = p.publish("PhotoEditor-Setup-99.0.0.exe", FULL)
+    small_sha = p.publish("PhotoEditor-Update-99.0.0.exe", SMALL)
+    p.manifest(version="99.0.0", installer="PhotoEditor-Setup-99.0.0.exe", sha256=full_sha,
+               update_installer="PhotoEditor-Update-99.0.0.exe", update_sha256=small_sha,
+               runtime_id="abc123", notes="Big fake release")
+    p.installed_runtime = None
+    version, path, notes = p.check()
+    assert (version, notes) == ("99.0.0", "Big fake release")
+    assert Path(path).name == "PhotoEditor-Setup-99.0.0.exe" and Path(path).read_bytes() == FULL
+print("OK: no installed fingerprint -> full installer, downloaded and verified")
 
-# ------------------------------------------------------------- THE bug this is modeled to survive
-print("=== manifest names an installer that doesn't actually exist (the trading-app bug) ===")
-with tempfile.TemporaryDirectory() as tmp:
-    worker, feed_dir, events = make_worker_and_feed(tmp)
-    write_manifest(feed_dir, "99.0.0", "PhotoEditor-Setup.exe", "0" * 64)  # never wrote the file
-    worker._check()  # must not raise
-    assert events["available"] is None, "must NOT offer an update it can't actually deliver"
-print("OK: drifted manifest -> no crash, no false update offer (would need the log line to notice)")
+print("=== matching runtime fingerprint gets the small update-only package ===")
+with FakePortal() as p:
+    full_sha = p.publish("PhotoEditor-Setup-99.0.0.exe", FULL)
+    small_sha = p.publish("PhotoEditor-Update-99.0.0.exe", SMALL)
+    p.manifest(version="99.0.0", installer="PhotoEditor-Setup-99.0.0.exe", sha256=full_sha,
+               update_installer="PhotoEditor-Update-99.0.0.exe", update_sha256=small_sha, runtime_id="abc123")
+    p.installed_runtime = "abc123"
+    _, path, _ = p.check()
+    assert Path(path).name == "PhotoEditor-Update-99.0.0.exe" and Path(path).read_bytes() == SMALL
+    assert all("Setup" not in r[0] for r in p.downloads_requested()), "must not also fetch the full installer"
+print("OK: matching fingerprint -> small package only")
 
-# ------------------------------------------------------------- hash mismatch (corrupted/wrong file)
-print("=== installer present but hash doesn't match the manifest ===")
-with tempfile.TemporaryDirectory() as tmp:
-    worker, feed_dir, events = make_worker_and_feed(tmp)
-    write_fake_installer(feed_dir, "PhotoEditor-Setup.exe", content=b"corrupted or wrong file")
-    write_manifest(feed_dir, "99.0.0", "PhotoEditor-Setup.exe", "0" * 64)  # hash won't match
-    worker._check()
-    assert events["available"] is None, "must NOT offer an update whose hash doesn't verify"
-print("OK: hash mismatch -> no update offered")
+print("=== different runtime fingerprint gets the full installer ===")
+with FakePortal() as p:
+    full_sha = p.publish("PhotoEditor-Setup-99.0.0.exe", FULL)
+    small_sha = p.publish("PhotoEditor-Update-99.0.0.exe", SMALL)
+    p.manifest(version="99.0.0", installer="PhotoEditor-Setup-99.0.0.exe", sha256=full_sha,
+               update_installer="PhotoEditor-Update-99.0.0.exe", update_sha256=small_sha, runtime_id="new-runtime")
+    p.installed_runtime = "old-runtime"
+    _, path, _ = p.check()
+    assert Path(path).name == "PhotoEditor-Setup-99.0.0.exe"
+print("OK: runtime changed -> full installer")
 
-# ------------------------------------------------------------- malformed manifest
+print("=== manifest without update-only fields (pre-1.18 publish) gets the full installer ===")
+with FakePortal() as p:
+    full_sha = p.publish("PhotoEditor-Setup-99.0.0.exe", FULL)
+    p.manifest(version="99.0.0", installer="PhotoEditor-Setup-99.0.0.exe", sha256=full_sha)
+    p.installed_runtime = "abc123"
+    _, path, _ = p.check()
+    assert Path(path).name == "PhotoEditor-Setup-99.0.0.exe"
+print("OK: old-style manifest -> full installer")
+
+print("=== manifest names an installer that isn't published (the trading-app bug) ===")
+with FakePortal() as p:
+    p.manifest(version="99.0.0", installer="PhotoEditor-Setup-99.0.0.exe", sha256="0" * 64)
+    assert p.check() is None
+print("OK: drifted manifest -> 404 handled, no false update offer")
+
+print("=== downloaded file's hash doesn't match the manifest ===")
+with FakePortal() as p:
+    p.publish("PhotoEditor-Setup-99.0.0.exe", b"corrupted or wrong file")
+    p.manifest(version="99.0.0", installer="PhotoEditor-Setup-99.0.0.exe", sha256="0" * 64)
+    assert p.check() is None
+    assert not any(p.downloads.iterdir()), "a file that failed verification must not be left behind"
+print("OK: hash mismatch -> no update offered, download discarded")
+
+print("=== interrupted download resumes with a range request ===")
+with FakePortal() as p:
+    sha = p.publish("PhotoEditor-Setup-99.0.0.exe", FULL)
+    p.manifest(version="99.0.0", installer="PhotoEditor-Setup-99.0.0.exe", sha256=sha)
+    p.downloads.mkdir()
+    (p.downloads / "PhotoEditor-Setup-99.0.0.exe.part").write_bytes(FULL[:5000])  # left by a previous launch
+    _, path, _ = p.check()
+    assert Path(path).read_bytes() == FULL
+    assert p.downloads_requested() == [("/download/PhotoEditor-Setup-99.0.0.exe", "bytes=5000-")]
+    assert not (p.downloads / "PhotoEditor-Setup-99.0.0.exe.part").exists()
+print("OK: resumed from byte 5000 and verified")
+
+print("=== already downloaded and verified on an earlier launch (user clicked Later) ===")
+with FakePortal() as p:
+    sha = p.publish("PhotoEditor-Setup-99.0.0.exe", FULL)
+    p.manifest(version="99.0.0", installer="PhotoEditor-Setup-99.0.0.exe", sha256=sha)
+    p.downloads.mkdir()
+    (p.downloads / "PhotoEditor-Setup-99.0.0.exe").write_bytes(FULL)
+    (p.downloads / "PhotoEditor-Setup-98.0.0.exe").write_bytes(b"an older download")
+    _, path, _ = p.check()
+    assert Path(path).read_bytes() == FULL
+    assert not p.downloads_requested(), "a verified earlier download must be reused, not fetched again"
+    assert not (p.downloads / "PhotoEditor-Setup-98.0.0.exe").exists(), "older downloads should be cleaned up"
+print("OK: reused the verified download, removed the stale one")
+
 print("=== malformed manifest JSON ===")
-with tempfile.TemporaryDirectory() as tmp:
-    worker, feed_dir, events = make_worker_and_feed(tmp)
-    (feed_dir / updater.MANIFEST_NAME).write_text("{not valid json", encoding="utf-8")
-    try:
-        worker._check()
-    except Exception:
-        pass  # _check() itself may raise; run() (tested below) is what catches it
-    assert events["available"] is None
-print("OK: malformed manifest doesn't produce a false update offer")
+with FakePortal() as p:
+    (p.dir / updater.MANIFEST_NAME).write_text("{not valid json", encoding="utf-8")
+    assert p.check() is None
+print("OK: malformed manifest -> no offer, no crash")
 
-# ------------------------------------------------------------- run() never raises, always finishes
-print("=== run() swallows everything and always emits finished ===")
-with tempfile.TemporaryDirectory() as tmp:
-    worker, feed_dir, events = make_worker_and_feed(tmp)
-    (feed_dir / updater.MANIFEST_NAME).write_text("{not valid json", encoding="utf-8")
-    finished = {"fired": False}
-    worker.finished.connect(lambda: finished.update(fired=True))
-    worker.run()  # must not raise, no matter how broken the feed is
-    assert finished["fired"], "finished must fire even when the check itself blew up"
-print("OK: run() is fully exception-safe")
+print("=== portal unreachable ===")
+with FakePortal() as p:
+    port = p.server.server_port
+    p.server.shutdown()
+    p.server.server_close()
+    assert p.check() is None
+print("OK: unreachable portal -> no offer, no crash")
+
+print("=== the real feed URL points at the portal, not the old LAN share ===")
+assert updater.FEED_URL == "https://nas.taila13a0a.ts.net/apps/photo-editor/feed/photoeditor-latest.json"
+assert not hasattr(updater, "UPDATE_FEED_DIR")
+print("OK")
 
 print("\nALL UPDATER TESTS PASSED")

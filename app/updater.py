@@ -1,16 +1,19 @@
-"""Best-effort auto-update check against a version manifest on the NAS.
+"""Best-effort auto-update check against the app's release feed on the portal.
 
 Modeled on the update mechanism in Richard's other desktop app (Stock
 Signals, Electron + electron-updater against a "latest.yml"-style feed) --
 same shape, adapted for this app's Python/Inno Setup stack instead of
 Electron/NSIS:
   - check once per launch, never on a timer
-  - never fatal: any failure (share unreachable, malformed manifest,
+  - never fatal: any failure (portal unreachable, malformed manifest,
     missing/mismatched file, hash mismatch) is logged and silently
     swallowed -- the app must work exactly as if this file didn't exist
-  - the whole new installer is copied to local disk and hash-verified
+  - the whole new installer is downloaded to local disk and hash-verified
     BEFORE the user is ever told about it, so there's nothing to wait for
     once they say yes
+  - the small "update only" package (app code, ~2 MB) is used when the
+    installed runtime's fingerprint matches the one it was built for (see
+    installer/runtime_id.py); otherwise the full ~2.7 GB installer
   - the user decides when to install -- never forced, never silent
     without a click
 
@@ -28,10 +31,12 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
@@ -41,24 +46,25 @@ from .version import __version__
 
 log = logging.getLogger(__name__)
 
-# UNC path, not a drive letter -- Z: is how this particular machine happens
-# to have \\NAS\FamilyStorage mapped right now, but a drive mapping is a
-# per-machine/per-session thing, not guaranteed to exist (or use the same
-# letter) on every machine this app runs on.
-UPDATE_FEED_DIR = Path(r"\\NAS\FamilyStorage\shares\Personal\fotoeditor")
-# Namespaced, not the generic "latest.json" it started as: this folder
-# turned out to NOT be exclusively this app's -- confirmed live, a
-# completely unrelated app (Richard's separate Video Editor project) is
-# also publishing into it, and its own manifest was sitting right here
-# under that exact generic name. A hash check alone doesn't save you from
-# this: it only proves "the downloaded file matches what the manifest
-# said", not "this manifest is actually for this app" -- if this app ever
-# read the other one's feed, a version number that happened to compare as
-# "newer" would make it hash-verify and offer to install a stranger's
-# installer as if it were its own update. Namespacing the filename is what
-# actually prevents that, not coordinating with whatever else happens to
-# be writing here.
+# The portal (Tailscale Funnel, public HTTPS) rather than the
+# \\NAS\FamilyStorage share this used to read: that UNC path only resolves
+# on the home LAN, so a remote install never saw an update -- a friend
+# testing the app downloaded the full installer by hand for every release.
+# The portal serves exactly what installer/publish.ps1 puts in
+# \\NAS\SSD\FrontEnd\releases\photo-editor: the manifest from a declared
+# whitelist (feed/), installers only by the names the manifest gives
+# (download/), with HTTP range support.
+PORTAL_URL = "https://nas.taila13a0a.ts.net/apps/photo-editor"
+# Namespaced, not a generic "latest.json": the old feed folder turned out
+# to be shared with Richard's Video Editor, whose own manifest sat there
+# under exactly that name. Kept, along with the installer-name check below,
+# so a manifest that isn't this app's can never be trusted.
 MANIFEST_NAME = "photoeditor-latest.json"
+FEED_URL = f"{PORTAL_URL}/feed/{MANIFEST_NAME}"
+DOWNLOAD_URL = f"{PORTAL_URL}/download/"
+HTTP_TIMEOUT = 30  # seconds per connect/read, not for the whole download
+CHUNK = 1 << 20
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "PhotoEditor-update"
 
 
 def _is_packaged_install() -> bool:
@@ -94,72 +100,131 @@ class _UpdateCheckWorker(QObject):
             self.finished.emit()
 
     def _check(self):
-        manifest_path = UPDATE_FEED_DIR / MANIFEST_NAME
-        if not manifest_path.exists():
-            log.info("update check: no manifest at %s, skipping", manifest_path)
+        manifest = _fetch_manifest()
+        if manifest is None:
             return
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
         remote_version = manifest["version"]
-        installer_name = manifest["installer"]
-        expected_sha256 = manifest["sha256"].lower()
         notes = manifest.get("notes", "")
-
-        # Belt and suspenders on top of the namespaced manifest filename
-        # above: confirmed live that this feed directory isn't exclusively
-        # this app's, so if a manifest ever somehow ends up here under this
-        # name that isn't actually this app's (a future third app reusing
-        # the name, a copy-paste mistake, anything), this is what stops it
-        # from being trusted rather than a hash check that would happily
-        # "verify" a stranger's installer against its own (correct, but
-        # irrelevant) hash.
-        if "photoeditor" not in installer_name.lower():
-            log.error(
-                "update check: manifest %s names installer %r, which doesn't look like this "
-                "app's -- refusing to trust it (this feed directory is shared with other apps)",
-                manifest_path, installer_name,
-            )
-            return
-
         if _parse_version(remote_version) <= _parse_version(__version__):
             log.info("update check: already on %s (feed has %s)", __version__, remote_version)
             return
 
-        installer_path = UPDATE_FEED_DIR / installer_name
-        if not installer_path.exists():
-            # Exactly the failure mode that bit the trading app once already:
-            # the manifest advertises a version whose installer isn't
-            # actually there (name drift between build and publish). There's
-            # no dialog for a background check, so a loud log line is the
-            # only thing standing between this and silently never updating
-            # again for good.
-            log.error(
-                "update check: manifest %s advertises %s but %s does not exist -- "
-                "publish.ps1's copy and this manifest have drifted out of sync",
-                manifest_path, remote_version, installer_path,
-            )
+        name, expected_sha256 = _choose_package(manifest)
+        # Belt and suspenders on top of the namespaced manifest name: a
+        # manifest that isn't this app's must never be trusted, and a hash
+        # check alone can't tell -- it would happily "verify" a stranger's
+        # installer against that stranger's (correct, but irrelevant) hash.
+        if not _looks_like_ours(name):
+            log.error("update check: manifest names installer %r, which isn't this app's -- refusing it", name)
             return
 
-        # Copy to local disk and verify BEFORE telling the user anything --
-        # a share hiccup mid-copy must never surface as "an update is ready"
-        # when it isn't.
-        tmp_dir = Path(tempfile.gettempdir()) / "PhotoEditor-update"
-        tmp_dir.mkdir(exist_ok=True)
-        local_path = tmp_dir / installer_name
-        shutil.copyfile(installer_path, local_path)
-
-        actual_sha256 = hashlib.sha256(local_path.read_bytes()).hexdigest()
-        if actual_sha256 != expected_sha256:
-            log.error(
-                "update check: downloaded installer hash mismatch (expected %s, got %s) -- "
-                "discarding, treating as no update available",
-                expected_sha256, actual_sha256,
-            )
-            local_path.unlink(missing_ok=True)
+        local_path = _download_verified(name, expected_sha256)
+        if local_path is None:
             return
-
-        log.info("update check: %s -> %s downloaded and verified", __version__, remote_version)
+        log.info("update check: %s -> %s downloaded and verified (%s)", __version__, remote_version, name)
         self.updateAvailable.emit(remote_version, str(local_path), notes)
+
+
+def _installed_runtime_id() -> str | None:
+    """The fingerprint the full installer put into the bundled runtime
+    (installer/runtime_id.py). None for installs older than this mechanism,
+    which therefore always get the full installer once."""
+    try:
+        return (Path(sys.executable).resolve().parent / "runtime_id.txt").read_text(encoding="ascii").strip() or None
+    except OSError:
+        return None
+
+
+def _choose_package(manifest: dict) -> tuple[str, str]:
+    """(filename, sha256) of the package to fetch: the small update-only one
+    when this install's runtime is the one it was built for, else the full
+    installer. PhotoEditor-Update.iss re-checks the same fingerprint itself
+    before touching anything, so a wrong choice here can only make an
+    update decline, never break an install."""
+    small = manifest.get("update_installer")
+    small_sha = manifest.get("update_sha256")
+    wanted_runtime = manifest.get("runtime_id")
+    if small and small_sha and wanted_runtime and wanted_runtime == _installed_runtime_id():
+        return small, small_sha.lower()
+    return manifest["installer"], manifest["sha256"].lower()
+
+
+def _looks_like_ours(name: str) -> bool:
+    return "photoeditor" in name.lower() and not any(c in name for c in "/\\") and ".." not in name
+
+
+def _fetch_manifest() -> dict | None:
+    try:
+        with urllib.request.urlopen(urllib.request.Request(FEED_URL, headers={"Cache-Control": "no-cache"}),
+                                    timeout=HTTP_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            log.info("update check: no manifest at %s, skipping", FEED_URL)
+            return None
+        raise
+
+
+def _download_verified(name: str, expected_sha256: str) -> Path | None:
+    """Downloads DOWNLOAD_URL/<name> into DOWNLOAD_DIR and returns its path
+    only if its sha256 matches -- an interrupted or corrupted download must
+    never surface as "an update is ready". Resumes a partial download from
+    an earlier launch with an HTTP range request, reuses a finished verified
+    one (e.g. the user clicked Later last time), and hashes while streaming
+    instead of reading a 2.7 GB file back into memory."""
+    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    final = DOWNLOAD_DIR / name
+    part = DOWNLOAD_DIR / (name + ".part")
+    for stale in DOWNLOAD_DIR.iterdir():
+        if stale.name not in (final.name, part.name):
+            stale.unlink(missing_ok=True)
+
+    if final.exists():
+        if _sha256_of(final) == expected_sha256:
+            return final
+        final.unlink()
+
+    have = part.stat().st_size if part.exists() else 0
+    request = urllib.request.Request(DOWNLOAD_URL + urllib.parse.quote(name))
+    if have:
+        request.add_header("Range", f"bytes={have}-")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as resp:
+            mode = "ab" if (have and resp.status == 206) else "wb"
+            with open(part, mode) as out:
+                while chunk := resp.read(CHUNK):
+                    out.write(chunk)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            # The manifest advertises a file that isn't actually published --
+            # name drift between build and publish, the failure that silently
+            # broke the trading app's updates for months. A background check
+            # has no dialog, so a loud log line is the only signal.
+            log.error("update check: manifest names %s but %s%s is 404 -- publish.ps1's upload and "
+                      "the manifest have drifted out of sync", name, DOWNLOAD_URL, name)
+            return None
+        if exc.code == 416 and have:  # .part already complete or longer than the file
+            part.unlink(missing_ok=True)
+            return None
+        raise
+
+    actual = _sha256_of(part)
+    if actual != expected_sha256:
+        log.error("update check: downloaded %s hash mismatch (expected %s, got %s) -- discarding",
+                  name, expected_sha256, actual)
+        part.unlink(missing_ok=True)
+        return None
+    part.replace(final)
+    return final
+
+
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def check_for_updates(parent_window):
