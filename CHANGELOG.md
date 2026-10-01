@@ -18,6 +18,14 @@ git commits.
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-10-01
+### Added
+- Sort the library by Resolution (megapixels, largest first) -- e.g. to
+  pull a phone's 50MP shots ahead of its 12MP ones. File size can't do
+  this reliably: the two overlap heavily. The first time a folder is
+  opened after updating, the app reads every photo's dimensions once
+  (a few extra seconds on a very large folder); after that it's instant.
+
 ## [1.17.1] - 2026-10-01
 ### Fixed
 - Auto Enhance could suggest a wildly overexposed result (e.g. +2 EV on an
