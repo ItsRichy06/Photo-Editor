@@ -307,6 +307,18 @@ class Catalog:
             )
             self.conn.commit()
 
+    def set_dimensions_bulk(self, items: list[tuple[int, int, int]]):
+        """items: [(photo_id, width, height), ...] in one transaction -- the
+        folder scan fills these in for every photo it hasn't seen before,
+        which on a big folder is thousands of rows."""
+        if not items:
+            return
+        with self._lock:
+            self.conn.executemany(
+                "UPDATE photos SET width=?, height=? WHERE id=?", [(w, h, pid) for pid, w, h in items]
+            )
+            self.conn.commit()
+
     def set_rating(self, photo_id: int, rating: int, source: str = "manual"):
         """source: "manual" (the user rated it) or "auto" (Auto-Rate Unrated
         filled it in) -- ignored and stored as NULL when clearing a rating
