@@ -18,6 +18,21 @@ git commits.
 
 ## [Unreleased]
 
+## [1.17.1] - 2026-10-01
+### Fixed
+- Auto Enhance could suggest a wildly overexposed result (e.g. +2 EV on an
+  already correctly-exposed photo) and apply it with no check -- the AI's
+  own stated reasoning for a suggestion doesn't reliably reflect the actual
+  histogram it was given. It now renders its own suggestion through the
+  real editing pipeline first and scales exposure/contrast/highlights back
+  if the result would clip substantially more of the photo than it already
+  was, before ever showing it to you.
+- Auto-Rate Unrated now explains *why* when it rates 0 photos instead of
+  just saying "Rated 0 photos" -- e.g. if the folder's files were renamed
+  or moved since it was opened, it says so and suggests reloading with
+  Open Folder, rather than silently skipping every photo with no reason
+  shown.
+
 ## [1.17.0] - 2026-09-30
 ### Added
 - Canon CR2 RAW support: CR2 files show up in the library (and under
