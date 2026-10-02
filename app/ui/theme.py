@@ -155,6 +155,14 @@ QPushButton[variant="danger"]:hover {{
     border-color: #6b3535;
     color: #ff9d9d;
 }}
+/* Variant rules come after the generic :disabled rule and outrank it, so
+   each variant needs its own disabled look -- without this a disabled
+   Delete (nothing selected) still looked live and red. */
+QPushButton[variant="danger"]:disabled {{
+    background: #1e1a1a;
+    border-color: #2e2626;
+    color: #6e5252;
+}}
 
 /* ---- dropdowns ------------------------------------------------------- */
 /* The ::drop-down subcontrol must be styled explicitly: left alone, Qt
