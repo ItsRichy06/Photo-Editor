@@ -354,6 +354,22 @@ class Catalog:
             self.conn.execute(f"DELETE FROM photos WHERE id IN ({placeholders})", photo_ids)
             self.conn.commit()
 
+    def move_photo_paths(self, moves: list[tuple[str, str]]):
+        """moves: [(old_path, new_path)] for files that were moved on disk.
+        Re-points each photo's row so its rating, flag and edits follow the
+        file. A row already sitting at new_path can only be stale (the move
+        just proved no file was there), so it's dropped first. Paths that
+        were never in the catalog (e.g. a sidecar file) are simply no-ops."""
+        with self._lock:
+            for old, new in moves:
+                old, new = str(Path(old).resolve()), str(Path(new).resolve())
+                stale = self.conn.execute("SELECT id FROM photos WHERE path=?", (new,)).fetchone()
+                if stale:
+                    self.conn.execute("DELETE FROM edits WHERE photo_id=?", (stale["id"],))
+                    self.conn.execute("DELETE FROM photos WHERE id=?", (stale["id"],))
+                self.conn.execute("UPDATE photos SET path=? WHERE path=?", (new, old))
+            self.conn.commit()
+
     def set_source_kind(self, photo_id: int, kind: str | None):
         """kind: None for a normal photo, "focus" or "hdr" for a photo
         produced by the Stack Photos feature -- lets the library filter to

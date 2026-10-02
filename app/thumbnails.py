@@ -30,6 +30,17 @@ def _cache_path(path: str, mtime: float, size: int) -> Path:
     return THUMB_CACHE_DIR / f"{digest}.jpg"
 
 
+def move_cached(old_path: str, new_path: str, mtime: float, size: int = 320):
+    """After a file move (same mtime, new path), carry its cached thumbnail
+    over so the moved photo shows up instantly. Best-effort."""
+    old = _cache_path(old_path, mtime, size)
+    if old.exists():
+        try:
+            old.replace(_cache_path(new_path, mtime, size))
+        except OSError:
+            pass
+
+
 def get_thumbnail(path, size: int = 320) -> Image.Image:
     """Return a PIL.Image thumbnail (RGB, long edge <= size)."""
     path = Path(path)
