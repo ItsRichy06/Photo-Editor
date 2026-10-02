@@ -14,7 +14,7 @@ from pathlib import Path
 import send2trash
 
 from PySide6.QtCore import QObject, QPointF, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import image_io
-from . import widgets
+from . import theme, widgets
 from .library_view import PhotoListModel
 
 # Long-edge px for the viewer's preview decode -- smaller than the editor's
@@ -121,10 +121,11 @@ class _ImageArea(QWidget):
 
     prevRequested = Signal()
     nextRequested = Signal()
+    doubleClicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background: #111111;")
+        self.setStyleSheet("background: #0f0f0f;")
         self._pixmap = None
 
         self.image_label = QLabel(self)
@@ -149,6 +150,11 @@ class _ImageArea(QWidget):
     def set_pixmap(self, pixmap):
         self._pixmap = pixmap
         self._rescale()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -212,11 +218,11 @@ class _ScrubBar(QWidget):
         mid_y = self.height() // 2
         w = self.width()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#333333"))
+        painter.setBrush(QColor(theme.BORDER))
         painter.drawRoundedRect(QRect(0, mid_y - 2, w, 4), 2, 2)
         fill_w = int(w * self._fraction)
         if fill_w > 0:
-            painter.setBrush(QColor("#1d9e75"))
+            painter.setBrush(QColor(theme.ACCENT))
             painter.drawRoundedRect(QRect(0, mid_y - 2, fill_w, 4), 2, 2)
         painter.setPen(QPen(QColor("#141414"), 2))
         painter.setBrush(QColor("#eaeaea"))
@@ -309,7 +315,7 @@ class _FilmstripDelegate(QStyledItemDelegate):
             painter.fillRect(rect, QColor("#333333"))
         painter.setClipping(False)
         if is_current:
-            painter.setPen(QPen(QColor("#1d9e75"), 2))
+            painter.setPen(QPen(QColor(theme.ACCENT), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect.adjusted(1, 1, -2, -2))
         painter.restore()
@@ -347,12 +353,11 @@ class PhotoViewerView(QWidget):
         self._proxy_change_timer.setInterval(0)
         self._proxy_change_timer.timeout.connect(self._apply_proxy_change)
 
-        self.setStyleSheet("background: #1c1c1c;")
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addLayout(self._build_header())
+        root.addWidget(self._build_header())
 
         main_row = QHBoxLayout()
         main_row.setContentsMargins(0, 0, 0, 0)
@@ -360,6 +365,8 @@ class PhotoViewerView(QWidget):
         self.image_area = _ImageArea()
         self.image_area.prevRequested.connect(self.show_previous)
         self.image_area.nextRequested.connect(self.show_next)
+        self.image_area.doubleClicked.connect(self._on_edit_clicked)
+        self.image_area.setToolTip("Double-click (or press E) to edit")
         main_row.addWidget(self.image_area, stretch=1)
         main_row.addWidget(self._build_side_panel())
         root.addLayout(main_row, stretch=1)
@@ -367,9 +374,11 @@ class PhotoViewerView(QWidget):
         self.scrub_bar = _ScrubBar()
         self.scrub_bar.positionChanged.connect(self._on_scrub)
         scrub_wrap = QWidget()
-        scrub_wrap.setStyleSheet("background: #1a1a1a;")
+        scrub_wrap.setObjectName("scrubWrap")
+        scrub_wrap.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        scrub_wrap.setStyleSheet(f"#scrubWrap {{ background: {theme.PANEL}; border-top: 1px solid {theme.BORDER}; }}")
         scrub_layout = QHBoxLayout(scrub_wrap)
-        scrub_layout.setContentsMargins(10, 0, 10, 0)
+        scrub_layout.setContentsMargins(12, 4, 12, 0)
         scrub_layout.addWidget(self.scrub_bar)
         root.addWidget(scrub_wrap)
 
@@ -379,16 +388,28 @@ class PhotoViewerView(QWidget):
 
     # ------------------------------------------------------------- layout
 
-    def _build_header(self) -> QHBoxLayout:
-        header = QHBoxLayout()
-        header.setContentsMargins(18, 12, 18, 12)
+    def _build_header(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("viewerHeader")
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        bar.setStyleSheet(f"#viewerHeader {{ background: {theme.PANEL}; border-bottom: 1px solid {theme.BORDER}; }}")
+        header = QHBoxLayout(bar)
+        header.setContentsMargins(10, 10, 16, 10)
+        header.setSpacing(10)
 
-        back_btn = QPushButton("✕  Back to library")
-        back_btn.setFlat(True)
+        back_btn = QPushButton("‹  Library")
+        back_btn.setProperty("variant", "ghost")
         back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        back_btn.setStyleSheet("QPushButton { color: #aaaaaa; border: none; text-align: left; font-size: 15px; }")
+        back_btn.setToolTip("Back to the library (Esc)")
         back_btn.clicked.connect(self.backRequested)
         header.addWidget(back_btn)
+
+        self.name_label = QLabel("")
+        self.name_label.setProperty("role", "title")
+        header.addWidget(self.name_label)
+        self.position_label = QLabel("")
+        self.position_label.setProperty("role", "muted")
+        header.addWidget(self.position_label)
 
         header.addStretch(1)
 
@@ -396,42 +417,38 @@ class PhotoViewerView(QWidget):
         self.type_filter.addItems(["All formats", "JPEG only", "RAW only"])
         self.type_filter.setToolTip("Filter which photos you navigate through here (shared with the library).")
         self.type_filter.currentIndexChanged.connect(self._on_type_filter_changed)
-        self.type_filter.setStyleSheet("font-size: 14px; padding: 3px 6px;")
         header.addWidget(self.type_filter)
-
-        self.position_label = QLabel("")
-        self.position_label.setStyleSheet("color: #999999; font-size: 15px; margin-left: 16px;")
-        header.addWidget(self.position_label)
-        return header
+        return bar
 
     def _build_side_panel(self) -> QWidget:
-        # Two earlier widening passes (148->190->260px) grew every element,
-        # each confirmed by pixel-measuring real screenshots, but still read
-        # as "unchanged" on a real screen and lacked the sketch's icon rows
-        # for individual specs. This pass widens further, makes Edit/Delete
-        # real full-width buttons with real vertical weight (not padding on
-        # a text label), and gives every EXIF spec its own icon + row.
         panel = QWidget()
-        panel.setFixedWidth(320)
-        panel.setStyleSheet("background: #202020;")
+        panel.setObjectName("viewerPanel")
+        panel.setFixedWidth(300)
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        panel.setStyleSheet(f"#viewerPanel {{ background: {theme.PANEL}; border-left: 1px solid {theme.BORDER}; }}")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(24, 24, 24, 0)
-        layout.setSpacing(20)
+        layout.setContentsMargins(20, 20, 20, 0)
+        layout.setSpacing(14)
 
-        self.edit_btn = QPushButton("Edit")
+        self.edit_btn = QPushButton("Edit Photo")
+        self.edit_btn.setProperty("variant", "primary")
         self.edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.edit_btn.setFixedHeight(58)
-        self.edit_btn.setStyleSheet(
-            "QPushButton { background: #1d9e75; color: #08211a; font-weight: 600; border: none; "
-            "border-radius: 8px; font-size: 20px; }"
-            "QPushButton:hover { background: #24b989; }"
-        )
+        self.edit_btn.setFixedHeight(40)
+        self.edit_btn.setToolTip("Open in the editor (E, or double-click the photo)")
         self.edit_btn.clicked.connect(self._on_edit_clicked)
         layout.addWidget(self.edit_btn)
 
+        layout.addSpacing(6)
+        details = QLabel("DETAILS")
+        details.setProperty("role", "section")
+        layout.addWidget(details)
+
         self.camera_label = QLabel("")
         self.camera_label.setWordWrap(True)
-        self.camera_label.setStyleSheet("color: #cfcfcf; font-size: 17px; font-weight: 500; margin-top: 2px;")
+        f = self.camera_label.font()
+        f.setPointSizeF(f.pointSizeF() + 1)
+        f.setWeight(QFont.Weight.DemiBold)
+        self.camera_label.setFont(f)
         layout.addWidget(self.camera_label)
 
         # Each spec (lens, focal length, aperture, shutter, ISO) gets its own
@@ -439,49 +456,45 @@ class PhotoViewerView(QWidget):
         # exist varies (see _populate_exif), rather than one rich-text block.
         self.exif_container = QWidget()
         self.exif_layout = QVBoxLayout(self.exif_container)
-        self.exif_layout.setContentsMargins(0, 6, 0, 0)
-        self.exif_layout.setSpacing(14)
+        self.exif_layout.setContentsMargins(0, 0, 0, 0)
+        self.exif_layout.setSpacing(10)
         layout.addWidget(self.exif_container)
 
         layout.addStretch(1)
 
-        self.rating_widget = widgets.StarRatingWidget(star_size=32)
+        rating_title = QLabel("RATING")
+        rating_title.setProperty("role", "section")
+        layout.addWidget(rating_title)
+        self.rating_widget = widgets.StarRatingWidget(star_size=28)
         self.rating_widget.ratingChanged.connect(self._on_rating_changed)
-        rating_row = QHBoxLayout()
-        rating_row.addStretch(1)
-        rating_row.addWidget(self.rating_widget)
-        rating_row.addStretch(1)
-        layout.addLayout(rating_row)
+        layout.addWidget(self.rating_widget)
 
-        self.delete_btn = QPushButton("Delete")
+        layout.addSpacing(8)
+        self.delete_btn = QPushButton("Delete Photo…")
+        self.delete_btn.setProperty("variant", "danger")
         self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.delete_btn.setFixedHeight(50)
-        self.delete_btn.setStyleSheet(
-            "QPushButton { background: #2a1e1e; color: #e28f8f; border: 1px solid #4a2b2b; "
-            "border-radius: 8px; font-weight: 500; font-size: 16px; margin-top: 4px; }"
-            "QPushButton:hover { background: #3a2222; color: #ff9d9d; border-color: #6b3535; }"
-        )
+        self.delete_btn.setFixedHeight(34)
         self.delete_btn.clicked.connect(self._on_delete_clicked)
         layout.addWidget(self.delete_btn)
-        layout.addSpacing(20)
+        layout.addSpacing(18)
         return panel
 
     def _spec_row(self, kind: str, text: str) -> QWidget:
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(12)
-        row_layout.addWidget(_SpecIcon(kind))
+        row_layout.setSpacing(10)
+        row_layout.addWidget(_SpecIcon(kind, size=18, color=theme.FAINT))
         label = QLabel(escape(text))
         label.setWordWrap(True)
-        label.setStyleSheet("color: #9c9c9c; font-size: 16px;")
+        label.setProperty("role", "muted")
         row_layout.addWidget(label, stretch=1)
         return row
 
     def _build_filmstrip(self) -> QListView:
         self.filmstrip = QListView()
         self.filmstrip.setFixedHeight(FILMSTRIP_ITEM_H + 12)
-        self.filmstrip.setStyleSheet("background: #1a1a1a; border: none;")
+        self.filmstrip.setStyleSheet(f"QListView {{ background: {theme.PANEL}; border: none; }}")
         self.filmstrip.setViewMode(QListView.ViewMode.IconMode)
         self.filmstrip.setFlow(QListView.Flow.LeftToRight)
         self.filmstrip.setWrapping(False)
@@ -519,7 +532,8 @@ class PhotoViewerView(QWidget):
             self.filmstrip.reset()  # cheap on a proxy this size; forces the delegate's new sizeHint to apply
 
     def _install_shortcuts(self):
-        for seq, slot in (("Left", self.show_previous), ("Right", self.show_next), ("Escape", self.backRequested.emit)):
+        for seq, slot in (("Left", self.show_previous), ("Right", self.show_next), ("Escape", self.backRequested.emit),
+                          ("E", self._on_edit_clicked)):
             sc = QShortcut(QKeySequence(seq), self)
             sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             sc.activated.connect(slot)
@@ -619,7 +633,8 @@ class PhotoViewerView(QWidget):
         self._current_id = photo_id
         self._current_path = path
 
-        self.position_label.setText(f"{name}    ·    {row + 1} of {total}")
+        self.name_label.setText(name)
+        self.position_label.setText(f"{row + 1:,} of {total:,}")
         self.rating_widget.set_rating(rating)
         self.scrub_bar.set_fraction(row / (total - 1) if total > 1 else 0.0)
         self.filmstrip.setCurrentIndex(index)

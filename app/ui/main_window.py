@@ -33,6 +33,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.stack)
 
         self.library_view.openPhotoRequested.connect(self._open_viewer)
+        self.library_view.editPhotoRequested.connect(self._open_editor)
         self.viewer_view.backRequested.connect(self._show_library)
         self.viewer_view.editRequested.connect(self._open_editor)
         self.editor_view.backRequested.connect(self._show_library)

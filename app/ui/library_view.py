@@ -31,36 +31,43 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainterPath, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDialog,
-    QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListView,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QStackedWidget,
     QStyle,
     QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
 
-from .. import image_io, quality, thumbnails
+from .. import image_io, organize, quality, thumbnails
 from ..settings import LAST_LIBRARY_FOLDER, get_settings
-from . import stacking_dialogs, widgets
+from . import stacking_dialogs, theme, widgets
+from .folder_sidebar import FolderSidebar, _show_in_explorer
 
 THUMB_SIZE = 320
-CELL_W = 190
+# Grid cells are sized to fill the view's width (LibraryView._update_cell_size):
+# as many columns as fit at roughly CELL_TARGET_W, then stretched to fill.
+CELL_TARGET_W = 210
+CELL_W = 210
 CELL_H = 236
-THUMB_MARGIN = 8
-THUMB_H = 150
-STAR_SIZE = 16
-STAR_Y_OFFSET = 178
+CARD_GAP = 5          # space around each card inside its grid cell
+CARD_PAD = 8          # card edge to thumbnail
+INFO_H = 46           # filename + stars below the thumbnail
+THUMB_ASPECT = 0.84   # thumbnail area height / width: between 3:2 landscape and portrait, so neither looks lost
+STAR_SIZE = 14
 
 
 class PhotoListModel(QAbstractListModel):
@@ -176,6 +183,14 @@ class PhotoListModel(QAbstractListModel):
         self._items[row]["rating_source"] = source if rating > 0 else None
         idx = self.index(row)
         self.dataChanged.emit(idx, idx, [self.RatingRole, self.RatingSourceRole])
+
+    def set_flag_by_id(self, photo_id, flag: str):
+        row = self._id_to_row.get(photo_id)
+        if row is None:
+            return
+        self._items[row]["flag"] = flag
+        idx = self.index(row)
+        self.dataChanged.emit(idx, idx, [self.FlagRole])
 
     def remove_photo(self, photo_id):
         """Surgically drop one photo (e.g. after the viewer deletes it) --
@@ -299,67 +314,117 @@ class PhotoFilterProxy(QSortFilterProxyModel):
 
 
 class PhotoDelegate(QStyledItemDelegate):
+    """Paints one grid cell as a card: the thumbnail fit into a 3:2 area,
+    filename, star rating, and pick/reject state. Cell size is set from
+    outside (LibraryView._update_cell_size) so the grid always fills the
+    view's width."""
+
     ratingEdited = Signal(int, int)  # photo_id, rating
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cell = QSize(CELL_W, CELL_H)
+
     def sizeHint(self, option, index):
-        return QSize(CELL_W, CELL_H)
+        return self.cell
+
+    # Geometry shared by paint() and editorEvent(), so the clickable stars
+    # are always exactly where they're drawn.
+    @staticmethod
+    def card_rect(rect: QRect) -> QRect:
+        return rect.adjusted(CARD_GAP, CARD_GAP, -CARD_GAP, -CARD_GAP)
+
+    @staticmethod
+    def thumb_rect(card: QRect) -> QRect:
+        return QRect(card.x() + CARD_PAD, card.y() + CARD_PAD, card.width() - 2 * CARD_PAD,
+                     card.height() - 2 * CARD_PAD - INFO_H)
+
+    @staticmethod
+    def stars_origin(card: QRect) -> QPoint:
+        return QPoint(card.x() + CARD_PAD, card.bottom() - CARD_PAD - STAR_SIZE + 1)
 
     def paint(self, painter, option, index):
         painter.save()
-        rect = option.rect
-        painter.fillRect(rect, QColor("#2d5a8c") if option.state & QStyle.StateFlag.State_Selected else QColor("#262626"))
+        painter.setRenderHint(painter.RenderHint.Antialiasing)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        card = self.card_rect(option.rect)
 
-        thumb_rect = QRect(rect.x() + THUMB_MARGIN, rect.y() + THUMB_MARGIN, CELL_W - 2 * THUMB_MARGIN, THUMB_H)
+        bg = QColor("#173a48") if selected else QColor(theme.SURFACE if hovered else "#1b1b1b")
+        painter.setPen(QColor(theme.ACCENT) if selected else Qt.PenStyle.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(card.adjusted(0, 0, -1, -1), 8, 8)
+
+        area = self.thumb_rect(card)
         pixmap = index.data(Qt.ItemDataRole.DecorationRole)
+        flag = index.data(PhotoListModel.FlagRole)
         if pixmap:
-            scaled = pixmap.scaled(
-                thumb_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-            )
-            x = thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2
-            y = thumb_rect.y() + (thumb_rect.height() - scaled.height()) // 2
-            painter.drawPixmap(x, y, scaled)
+            scaled = pixmap.scaled(area.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            target = QRect(area.x() + (area.width() - scaled.width()) // 2,
+                           area.y() + (area.height() - scaled.height()) // 2, scaled.width(), scaled.height())
+            clip = QPainterPath()
+            clip.addRoundedRect(target, 4, 4)
+            painter.save()
+            painter.setClipPath(clip)
+            if flag == "reject":
+                painter.setOpacity(0.35)
+            painter.drawPixmap(target, scaled)
+            painter.restore()
         else:
-            painter.fillRect(thumb_rect, QColor("#3a3a3a"))
-            painter.setPen(QColor("#888888"))
-            painter.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "Loading…")
+            target = area
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#222222"))
+            painter.drawRoundedRect(area, 4, 4)
+            painter.setPen(QColor(theme.FAINT))
+            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, "Loading…")
 
-        if index.data(PhotoListModel.IsRawRole):
-            painter.setPen(QColor("#66aaff"))
-            painter.drawText(QRect(rect.right() - 42, rect.y() + 10, 36, 16), Qt.AlignmentFlag.AlignRight, "RAW")
+        small = QFont(option.font)
+        small.setPointSizeF(max(7.0, option.font.pointSizeF() - 2))
+        small.setWeight(QFont.Weight.DemiBold)
+        if index.data(PhotoListModel.IsRawRole) and pixmap:
+            painter.setFont(small)
+            badge = QRect(target.x() + 6, target.y() + 6, painter.fontMetrics().horizontalAdvance("RAW") + 10, 16)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 160))
+            painter.drawRoundedRect(badge, 4, 4)
+            painter.setPen(QColor("#e0e0e0"))
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, "RAW")
 
+        painter.setFont(option.font)
         name = index.data(PhotoListModel.NameRole) or ""
-        name_rect = QRect(rect.x() + THUMB_MARGIN, rect.y() + THUMB_MARGIN + THUMB_H + 4, CELL_W - 2 * THUMB_MARGIN, 16)
-        painter.setPen(QColor("#cccccc"))
+        name_rect = QRect(card.x() + CARD_PAD, area.bottom() + 8, card.width() - 2 * CARD_PAD, 18)
+        painter.setPen(QColor("#ffffff" if selected else theme.TEXT))
         elided = painter.fontMetrics().elidedText(name, Qt.TextElideMode.ElideMiddle, name_rect.width())
-        painter.drawText(name_rect, Qt.AlignmentFlag.AlignLeft, elided)
+        painter.drawText(name_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided)
 
         rating = index.data(PhotoListModel.RatingRole) or 0
-        star_y = rect.y() + STAR_Y_OFFSET
+        origin = self.stars_origin(card)
         for i in range(5):
             filled = i < rating
-            color = QColor("#f5b301") if filled else QColor("#777777")
+            color = QColor(theme.STAR) if filled else QColor("#555555")
             painter.setPen(color)
             painter.setBrush(color if filled else QColor(0, 0, 0, 0))
-            widgets.StarRatingWidget._draw_star(painter, rect.x() + THUMB_MARGIN + i * STAR_SIZE + STAR_SIZE / 2, star_y + STAR_SIZE / 2, STAR_SIZE * 0.42)
+            widgets.StarRatingWidget._draw_star(
+                painter, origin.x() + i * (STAR_SIZE + 2) + STAR_SIZE / 2, origin.y() + STAR_SIZE / 2, STAR_SIZE * 0.42
+            )
 
-        flag = index.data(PhotoListModel.FlagRole)
-        flag_rect = QRect(rect.x() + THUMB_MARGIN, rect.y() + STAR_Y_OFFSET + 18, CELL_W - 2 * THUMB_MARGIN, 16)
-        if flag == "pick":
-            painter.setPen(QColor("#4caf50"))
-            painter.drawText(flag_rect, Qt.AlignmentFlag.AlignLeft, "✓ Pick")
-        elif flag == "reject":
-            painter.setPen(QColor("#e05252"))
-            painter.drawText(flag_rect, Qt.AlignmentFlag.AlignLeft, "✗ Reject")
+        if flag in ("pick", "reject"):
+            painter.setFont(small)
+            text, color = ("Pick", "#5cc97b") if flag == "pick" else ("Reject", theme.DANGER)
+            painter.setPen(QColor(color))
+            flag_rect = QRect(card.x() + CARD_PAD, origin.y() - 1, card.width() - 2 * CARD_PAD, STAR_SIZE + 2)
+            painter.drawText(flag_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, text)
 
         painter.restore()
 
     def editorEvent(self, event, model, option, index):
-        if event.type() == QEvent.Type.MouseButtonPress:
+        if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
-            rel_x = pos.x() - option.rect.x() - THUMB_MARGIN
-            rel_y = pos.y() - option.rect.y() - STAR_Y_OFFSET
-            if 0 <= rel_y <= STAR_SIZE and 0 <= rel_x <= STAR_SIZE * 5:
-                star_idx = int(rel_x // STAR_SIZE) + 1
+            origin = self.stars_origin(self.card_rect(option.rect))
+            rel_x = pos.x() - origin.x()
+            rel_y = pos.y() - origin.y()
+            if 0 <= rel_y <= STAR_SIZE and 0 <= rel_x < (STAR_SIZE + 2) * 5:
+                star_idx = int(rel_x // (STAR_SIZE + 2)) + 1
                 photo_id = index.data(PhotoListModel.PhotoIdRole)
                 current = index.data(PhotoListModel.RatingRole) or 0
                 new_rating = 0 if star_idx == current else star_idx
@@ -594,8 +659,21 @@ class AutoRateThread(QThread):
         self.finished_rating.emit(rated_count, failed, missing, example_error)
 
 
+def _filter_combo(items, tooltip, min_width=96) -> QComboBox:
+    combo = QComboBox()
+    combo.addItems(items)
+    combo.setToolTip(tooltip)
+    # An explicit minimum lets the layout squeeze the filter row on a narrow
+    # window (a 1280/1366px laptop screen) instead of the dropdowns' full text
+    # widths forcing the whole window to stay ~1300px wide; at normal widths
+    # each still gets its natural size.
+    combo.setMinimumWidth(min_width)
+    return combo
+
+
 class LibraryView(QWidget):
-    openPhotoRequested = Signal(int, str)
+    openPhotoRequested = Signal(int, str)  # the large viewer (double-click)
+    editPhotoRequested = Signal(int, str)  # straight to the editor (E, or the right-click menu)
 
     def __init__(self, catalog, parent=None):
         super().__init__(parent)
@@ -619,43 +697,79 @@ class LibraryView(QWidget):
         self.proxy = PhotoFilterProxy(self)
         self.proxy.setSourceModel(self.model)
 
-        main_layout = QVBoxLayout(self)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        toolbar = QHBoxLayout()
-        self.open_btn = QPushButton("Open Folder…")
-        self.open_btn.clicked.connect(self.choose_folder)
-        toolbar.addWidget(self.open_btn)
+        self.sidebar = FolderSidebar(self.settings, catalog)
+        self.sidebar.folderSelected.connect(self.load_folder)
+        root.addWidget(self.sidebar)
 
-        self.stack_btn = QPushButton("Stack Photos…")
-        self.stack_btn.setToolTip(
-            "Select 2+ photos (Ctrl/Shift-click), then auto-detect and merge HDR exposure "
-            "brackets and focus stacks among them."
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(0)
+        root.addLayout(right, stretch=1)
+
+        header = QWidget()
+        header.setObjectName("libraryHeader")
+        header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        header.setStyleSheet(f"#libraryHeader {{ background: {theme.PANEL}; border-bottom: 1px solid {theme.BORDER}; }}")
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(18, 12, 16, 12)
+        header_layout.setSpacing(10)
+        right.addWidget(header)
+
+        # Row 1: where you are, and what you can do with it.
+        title_row = QHBoxLayout()
+        title_row.setSpacing(10)
+        self.title_label = QLabel("Library")
+        self.title_label.setProperty("role", "title")
+        title_row.addWidget(self.title_label)
+        self.status_label = QLabel("")
+        self.status_label.setProperty("role", "muted")
+        title_row.addWidget(self.status_label)
+        title_row.addStretch(1)
+
+        def action_button(text, tip, slot, variant="ghost"):
+            btn = QPushButton(text)
+            btn.setProperty("variant", variant)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            title_row.addWidget(btn)
+            return btn
+
+        self.group_btn = action_button(
+            "Group into Folder…",
+            "Move the selected photos into a new folder inside this one (Ctrl+G). RAW+JPEG pairs move together.",
+            self._on_group_into_folder,
         )
-        self.stack_btn.clicked.connect(self._on_stack_photos)
-        toolbar.addWidget(self.stack_btn)
-
-        self.auto_rate_btn = QPushButton("Auto-Rate Unrated…")
-        self.auto_rate_btn.setToolTip(
-            "Give every photo with no star rating yet a rough 1-5 rating from automatic "
-            "sharpness/exposure detection (long exposures are exempted from the sharpness "
-            "check). Never touches a photo you've already rated by hand."
+        self.stack_btn = action_button(
+            "Stack Photos…",
+            "Select 2+ photos, then auto-detect and merge HDR exposure brackets and focus stacks among them.",
+            self._on_stack_photos,
         )
-        self.auto_rate_btn.clicked.connect(self._on_auto_rate_clicked)
-        toolbar.addWidget(self.auto_rate_btn)
-
-        self.delete_btn = QPushButton("Delete Selected…")
-        self.delete_btn.setToolTip(
-            "Select 1+ photos (Ctrl/Shift-click), then remove them from the library and send "
-            "the actual files to the Recycle Bin -- not a permanent delete, still recoverable "
-            "there afterward."
+        self.auto_rate_btn = action_button(
+            "Auto-Rate…",
+            "Give every photo with no star rating yet a rough 1-5 rating from automatic sharpness/exposure "
+            "detection. Never touches a photo you've already rated by hand.",
+            self._on_auto_rate_clicked,
         )
-        self.delete_btn.clicked.connect(self._on_delete_selected)
-        toolbar.addWidget(self.delete_btn)
+        self.delete_btn = action_button(
+            "Delete…",
+            "Send the selected photos to the Recycle Bin (Del) -- recoverable there afterward.",
+            self._on_delete_selected,
+        )
+        header_layout.addLayout(title_row)
 
+        # Row 2: narrowing down what's shown.
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search filename…")
+        self.search_box.setPlaceholderText("Search filenames")
         self.search_box.setClearButtonEnabled(True)
-        self.search_box.setMaximumWidth(200)
+        self.search_box.addAction(theme.icon("search"), QLineEdit.ActionPosition.LeadingPosition)
+        self.search_box.setMinimumWidth(130)
+        self.search_box.setMaximumWidth(260)
         # Debounced rather than filtering on every keystroke -- re-evaluating
         # the filter is cheap per keystroke individually, but typing a whole
         # word into a library of thousands of photos would otherwise re-run
@@ -666,52 +780,38 @@ class LibraryView(QWidget):
         self._search_timer.setInterval(200)
         self._search_timer.timeout.connect(lambda: self.proxy.set_search_text(self.search_box.text()))
         self.search_box.textChanged.connect(lambda _: self._search_timer.start())
-        toolbar.addWidget(self.search_box)
+        filter_row.addWidget(self.search_box)
 
-        toolbar.addWidget(QLabel("Show:"))
-        self.type_filter = QComboBox()
-        self.type_filter.addItems(["All formats", "JPEG only", "RAW only"])
+        self.type_filter = _filter_combo(["All formats", "JPEG only", "RAW only"], "Show JPEG, RAW, or both.")
         self.type_filter.currentIndexChanged.connect(self._on_type_filter_changed)
-        toolbar.addWidget(self.type_filter)
-
-        self.kind_filter = QComboBox()
-        self.kind_filter.addItems(["All photos", "Originals only", "Focus stacks", "HDR merges"])
-        self.kind_filter.setToolTip("Filter to just the merged outputs from Stack Photos, or hide them.")
-        self.kind_filter.currentIndexChanged.connect(self._on_kind_filter_changed)
-        toolbar.addWidget(self.kind_filter)
-
-        toolbar.addWidget(QLabel("Rating:"))
-        self.rating_filter = QComboBox()
-        self.rating_filter.addItems(["All", "1", "2", "3", "4", "5"])
-        self.rating_filter.setToolTip("Show only photos with exactly this many stars.")
-        self.rating_filter.currentIndexChanged.connect(lambda i: self.proxy.set_rating_filter(i))
-        toolbar.addWidget(self.rating_filter)
-
-        toolbar.addWidget(QLabel("Rated by:"))
-        self.rating_source_filter = QComboBox()
-        self.rating_source_filter.addItems(["All", "My ratings", "Auto-rated"])
-        self.rating_source_filter.setToolTip("Show only photos you rated yourself, or only ones Auto-Rate filled in.")
-        self.rating_source_filter.currentIndexChanged.connect(self._on_rating_source_filter_changed)
-        toolbar.addWidget(self.rating_source_filter)
-
-        toolbar.addWidget(QLabel("Sort:"))
-        self.sort_combo = QComboBox()
-        self.sort_combo.addItems(["Name", "Date modified", "Rating", "Resolution"])
-        self.sort_combo.setToolTip("Resolution sorts by megapixels, largest first.")
-        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
-        toolbar.addWidget(self.sort_combo)
-
-        self.status_label = QLabel("No folder opened")
-        toolbar.addWidget(self.status_label)
-        toolbar.addStretch(1)
-        main_layout.addLayout(toolbar)
-
-        hint = QLabel(
-            "Select a photo, then 1-5 = rate, P = pick, X = reject, U = clear flag, double-click = edit. "
-            "Ctrl/Shift-click to select multiple, then Stack Photos to auto-merge HDR/focus brackets."
+        filter_row.addWidget(self.type_filter)
+        self.kind_filter = _filter_combo(
+            ["All photos", "Originals only", "Focus stacks", "HDR merges"],
+            "Filter to just the merged outputs from Stack Photos, or hide them.",
         )
-        hint.setStyleSheet("color: #888888; font-size: 11px;")
-        main_layout.addWidget(hint)
+        self.kind_filter.currentIndexChanged.connect(self._on_kind_filter_changed)
+        filter_row.addWidget(self.kind_filter)
+        self.rating_filter = _filter_combo(
+            ["Any rating", "1 star", "2 stars", "3 stars", "4 stars", "5 stars"],
+            "Show only photos with exactly this many stars.",
+        )
+        self.rating_filter.currentIndexChanged.connect(lambda i: self.proxy.set_rating_filter(i))
+        filter_row.addWidget(self.rating_filter)
+        self.rating_source_filter = _filter_combo(
+            ["Rated by anyone", "My ratings", "Auto-rated"],
+            "Show only photos you rated yourself, or only ones Auto-Rate filled in.",
+        )
+        self.rating_source_filter.currentIndexChanged.connect(self._on_rating_source_filter_changed)
+        filter_row.addWidget(self.rating_source_filter)
+        filter_row.addStretch(1)
+        self.sort_combo = _filter_combo(
+            ["Sort: Name", "Sort: Date modified", "Sort: Rating", "Sort: Resolution"],
+            "Resolution sorts by megapixels, largest first.",
+            min_width=120,
+        )
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        filter_row.addWidget(self.sort_combo)
+        header_layout.addLayout(filter_row)
 
         self.list_view = QListView()
         self.list_view.setModel(self.proxy)
@@ -719,13 +819,29 @@ class LibraryView(QWidget):
         self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
         self.list_view.setMovement(QListView.Movement.Static)
         self.list_view.setUniformItemSizes(True)
-        self.list_view.setSpacing(6)
+        self.list_view.setSpacing(0)
         self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.list_view.verticalScrollBar().setSingleStep(40)
+        self.list_view.setContentsMargins(0, 0, 0, 0)
+        self.list_view.setViewportMargins(10, 8, 6, 8)
+        self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_view.customContextMenuRequested.connect(self._on_grid_context_menu)
         self.delegate = PhotoDelegate(self.list_view)
         self.delegate.ratingEdited.connect(self._on_rating_edited)
         self.list_view.setItemDelegate(self.delegate)
         self.list_view.doubleClicked.connect(self._on_double_clicked)
-        main_layout.addWidget(self.list_view, stretch=1)
+        self.list_view.viewport().installEventFilter(self)
+        self.list_view.selectionModel().selectionChanged.connect(lambda *_: self._update_selection_actions())
+
+        for sig in (self.proxy.rowsInserted, self.proxy.rowsRemoved, self.proxy.modelReset, self.proxy.layoutChanged):
+            sig.connect(lambda *_: self._update_status())
+
+        self.content = QStackedWidget()
+        self.content.addWidget(self._build_empty_state())
+        self.content.addWidget(self.list_view)
+        right.addWidget(self.content, stretch=1)
+        self._update_selection_actions()
 
         # Debounced so a fast scroll/drag doesn't re-walk the viewport on
         # every single pixel of movement -- one pass ~150ms after motion
@@ -744,7 +860,7 @@ class LibraryView(QWidget):
         # this folder scan runs. Guarded by _auto_load_pending: confirmed
         # live as a real bug that this singleShot(0) can still be sitting in
         # the event queue by the time the user manually opens a different
-        # folder (e.g. clicking Open Folder right at startup) -- without the
+        # folder (e.g. clicking another folder right at startup) -- without the
         # guard, this callback still fires afterward and silently reverts
         # back to the old folder, discarding the folder the user actually
         # picked. load_folder() clears the flag as soon as ANYTHING (this
@@ -761,50 +877,218 @@ class LibraryView(QWidget):
             self.load_folder(folder)
 
     def _install_shortcuts(self):
+        def bind(keys, slot):
+            sc = QShortcut(QKeySequence(keys), self.list_view)
+            sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc.activated.connect(slot)
+
         for i in range(6):
-            sc = QShortcut(QKeySequence(str(i)), self)
-            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            sc.activated.connect(lambda rating=i: self._rate_selected(rating))
-        sc_pick = QShortcut(QKeySequence("P"), self)
-        sc_pick.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_pick.activated.connect(lambda: self._flag_selected("pick"))
-        sc_reject = QShortcut(QKeySequence("X"), self)
-        sc_reject.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_reject.activated.connect(lambda: self._flag_selected("reject"))
-        sc_clear = QShortcut(QKeySequence("U"), self)
-        sc_clear.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_clear.activated.connect(lambda: self._flag_selected("none"))
+            bind(str(i), lambda rating=i: self._rate_selected(rating))
+        bind("P", lambda: self._flag_selected("pick"))
+        bind("X", lambda: self._flag_selected("reject"))
+        bind("U", lambda: self._flag_selected("none"))
+        bind("E", self._edit_current)
+        bind("Return", self._view_current)
+        bind("Delete", self._on_delete_selected)
+        bind("Ctrl+G", self._on_group_into_folder)
+
+    def _build_empty_state(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addStretch(1)
+        title = QLabel("No folder open")
+        title.setProperty("role", "title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        hint = QLabel("Pick a folder in the sidebar, or add one to your library.")
+        hint.setProperty("role", "muted")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(hint)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        add = QPushButton("Add Folder…")
+        add.setProperty("variant", "primary")
+        add.clicked.connect(self.choose_folder)
+        btn_row.addWidget(add)
+        btn_row.addStretch(1)
+        layout.addSpacing(10)
+        layout.addLayout(btn_row)
+        layout.addStretch(2)
+        return page
+
+    # ------------------------------------------------------------ grid sizing
+
+    def eventFilter(self, obj, event):
+        if obj is self.list_view.viewport() and event.type() == QEvent.Type.Resize:
+            self._update_cell_size()
+        return super().eventFilter(obj, event)
+
+    def _update_cell_size(self):
+        """As many columns as fit at about CELL_TARGET_W, stretched so the
+        grid exactly fills the width instead of leaving a dead strip."""
+        # The width QListView itself wraps rows at: its maximum viewport width
+        # minus a scrollbar's extent, whether or not the scrollbar is showing
+        # right now (QListViewPrivate::prepareItemsLayout). Sizing cells from
+        # the visible viewport width instead looked right at some window sizes
+        # and silently dropped a column at others, leaving a dead strip.
+        width = self.list_view.maximumViewportSize().width() - self.list_view.style().pixelMetric(
+            QStyle.PixelMetric.PM_ScrollBarExtent, None, self.list_view.verticalScrollBar())
+        if width <= 0:
+            return
+        cols = max(1, width // CELL_TARGET_W)
+        cell_w = (width - 1) // cols
+        thumb_w = cell_w - 2 * (CARD_GAP + CARD_PAD)
+        cell_h = int(thumb_w * THUMB_ASPECT) + 2 * (CARD_GAP + CARD_PAD) + INFO_H
+        size = QSize(cell_w, cell_h)
+        if size != self.delegate.cell:
+            self.delegate.cell = size
+            self.list_view.setGridSize(size)
+
+    # -------------------------------------------------------------- selection
+
+    def _selected_indexes(self):
+        sel = self.list_view.selectionModel()
+        return sel.selectedIndexes() if sel is not None else []
 
     def _current_index(self):
-        sel = self.list_view.selectionModel()
-        if sel is None:
-            return None
-        indexes = sel.selectedIndexes()
+        indexes = self._selected_indexes()
         return indexes[0] if indexes else None
 
-    def _rate_selected(self, rating: int):
-        index = self._current_index()
-        if index is None:
+    def _update_selection_actions(self):
+        n = len(self._selected_indexes())
+        self.group_btn.setEnabled(n > 0)
+        self.delete_btn.setEnabled(n > 0)
+        self.stack_btn.setEnabled(n > 1)
+        self._update_status()
+
+    def _update_status(self):
+        if self.current_folder is None:
+            self.status_label.setText("")
             return
-        photo_id = index.data(PhotoListModel.PhotoIdRole)
-        self.catalog.set_rating(photo_id, rating, source="manual")
-        self.proxy.setData(index, rating, PhotoListModel.RatingRole)
-        self.proxy.setData(index, "manual" if rating > 0 else None, PhotoListModel.RatingSourceRole)
+        if getattr(self, "_scanning", False):
+            self.status_label.setText("Scanning…")
+            return
+        total = self.proxy.rowCount()
+        text = f"{total:,} photo{'s' if total != 1 else ''}"
+        n = len(self._selected_indexes())
+        if n:
+            text += f"  ·  {n:,} selected"
+        self.status_label.setText(text)
+
+    def _rate_selected(self, rating: int):
+        # By photo id, not by index: under a rating sort, each change can
+        # move rows and invalidate the remaining indexes mid-loop.
+        ids = [i.data(PhotoListModel.PhotoIdRole) for i in self._selected_indexes()]
+        for pid in ids:
+            self.catalog.set_rating(pid, rating, source="manual")
+            self.model.set_rating_by_id(pid, rating, source="manual")
 
     def _flag_selected(self, flag: str):
+        ids = [i.data(PhotoListModel.PhotoIdRole) for i in self._selected_indexes()]
+        for pid in ids:
+            self.catalog.set_flag(pid, flag)
+            self.model.set_flag_by_id(pid, flag)
+
+    def _view_current(self):
         index = self._current_index()
-        if index is None:
+        if index is not None:
+            self._on_double_clicked(index)
+
+    def _edit_current(self):
+        index = self._current_index()
+        if index is not None:
+            self.editPhotoRequested.emit(index.data(PhotoListModel.PhotoIdRole), index.data(PhotoListModel.PathRole))
+
+    def _on_grid_context_menu(self, pos):
+        index = self.list_view.indexAt(pos)
+        if index.isValid() and not self.list_view.selectionModel().isSelected(index):
+            self.list_view.setCurrentIndex(index)  # right-clicking an unselected photo selects just it
+        n = len(self._selected_indexes())
+        if n == 0:
             return
-        photo_id = index.data(PhotoListModel.PhotoIdRole)
-        self.catalog.set_flag(photo_id, flag)
-        self.proxy.setData(index, flag, PhotoListModel.FlagRole)
+        menu = QMenu(self)
+
+        def add(text, slot, shortcut=None, enabled=True):
+            act = QAction(text, menu)
+            if shortcut:
+                act.setShortcut(QKeySequence(shortcut))
+            act.setEnabled(enabled)
+            act.triggered.connect(slot)
+            menu.addAction(act)
+            return act
+
+        add("View Large", self._view_current, "Return", enabled=n == 1)
+        add("Edit", self._edit_current, "E", enabled=n == 1)
+        menu.addSeparator()
+        rate = menu.addMenu("Rating")
+        for stars in range(6):
+            act = QAction("No stars" if stars == 0 else "★" * stars, rate)
+            act.setShortcut(QKeySequence(str(stars)))
+            act.triggered.connect(lambda _=False, s=stars: self._rate_selected(s))
+            rate.addAction(act)
+        add("Pick", lambda: self._flag_selected("pick"), "P")
+        add("Reject", lambda: self._flag_selected("reject"), "X")
+        add("Clear Flag", lambda: self._flag_selected("none"), "U")
+        menu.addSeparator()
+        add("Group into Folder…", self._on_group_into_folder, "Ctrl+G")
+        add("Stack Photos…", self._on_stack_photos, enabled=n > 1)
+        if n == 1:
+            add("Show in Explorer", lambda: _show_in_explorer(index.data(PhotoListModel.PathRole)))
+        menu.addSeparator()
+        add(f"Delete {n} Photo{'s' if n != 1 else ''}…", self._on_delete_selected, "Del")
+        menu.exec(self.list_view.viewport().mapToGlobal(pos))
 
     def choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose photo folder", self.settings.value(LAST_LIBRARY_FOLDER, "")
-        )
-        if folder:
-            self.load_folder(folder)
+        self.sidebar.choose_and_add()
+
+    # ------------------------------------------------------- group into folder
+
+    def _on_group_into_folder(self):
+        photos = self._selected_photos()
+        if not photos or not self.current_folder:
+            return
+        parent = Path(self.current_folder)
+        n = len(photos)
+        name = "New folder"
+        while True:
+            name, ok = QInputDialog.getText(
+                self,
+                "Group into Folder",
+                f"Move {n} selected photo{'s' if n != 1 else ''} into a new folder inside “{parent.name}”.\n"
+                "RAW+JPEG pairs move together; ratings and edits come along.\n\nFolder name:",
+                text=name,
+            )
+            if not ok:
+                return
+            problem = organize.folder_name_problem(name)
+            if problem:
+                QMessageBox.warning(self, "Group into Folder", problem)
+                continue
+            dest = parent / name
+            if dest.exists() and not dest.is_dir():
+                QMessageBox.warning(self, "Group into Folder", f"There's already a file named “{name}” here.")
+                continue
+            if dest.is_dir():
+                choice = QMessageBox.question(
+                    self, "Group into Folder",
+                    f"“{name}” already exists. Move the selected photos into it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if choice != QMessageBox.StandardButton.Yes:
+                    continue
+            break
+
+        result = organize.move_into_folder([p["path"] for p in photos], dest, self.catalog)
+        if result.skipped:
+            lines = "\n".join(f"  {Path(p).name}: {why}" for p, why in result.skipped[:8])
+            more = f"\n  …and {len(result.skipped) - 8} more" if len(result.skipped) > 8 else ""
+            QMessageBox.warning(
+                self, "Group into Folder",
+                f"Moved {result.photo_count} file{'s' if result.photo_count != 1 else ''} into “{name}”. "
+                f"{len(result.skipped)} couldn't be moved and were left where they were:\n{lines}{more}",
+            )
+        self.sidebar.refresh(str(parent))
+        self.load_folder(str(parent))
 
     def _retire_loader_thread(self, thread: "ThumbnailLoaderThread"):
         """Ask a superseded loader thread to stop and detach it from the UI,
@@ -836,9 +1120,17 @@ class LibraryView(QWidget):
             self._retire_loader_thread(self.loader_thread)
 
         self.model.clear()
+        folder = str(Path(folder))
         self.current_folder = folder
         self.settings.setValue(LAST_LIBRARY_FOLDER, folder)
-        self.status_label.setText("Scanning…")
+        self._scanning = True
+        self.title_label.setText(Path(folder).name or folder)
+        self.title_label.setToolTip(folder)
+        self.content.setCurrentWidget(self.list_view)
+        if self.sidebar._find_item(folder) is None:
+            self.sidebar.add_folder(folder)
+        self.sidebar.select_folder(folder)
+        self._update_status()
 
         self.loader_thread = ThumbnailLoaderThread(folder, self.catalog)
         self.loader_thread.scan_registered.connect(self._on_scan_registered)
@@ -849,7 +1141,8 @@ class LibraryView(QWidget):
 
     def _on_scan_registered(self, registered: list):
         self.model.add_photos(registered)
-        self.status_label.setText(f"{len(registered)} photos, loading thumbnails…")
+        self._scanning = False
+        self._update_status()
         # The view needs a layout pass over the newly-added rows before it can
         # report what's actually visible -- that happens on the next event
         # loop iteration, which a 0ms singleShot lands right after.
@@ -868,8 +1161,8 @@ class LibraryView(QWidget):
         buffer = viewport_rect.height()
         scan_rect = viewport_rect.adjusted(0, -buffer, 0, buffer)
 
-        step_x = max(1, CELL_W // 2)
-        step_y = max(1, CELL_H // 2)
+        step_x = max(1, self.delegate.cell.width() // 2)
+        step_y = max(1, self.delegate.cell.height() // 2)
         photo_ids = set()
         y = scan_rect.top()
         while y <= scan_rect.bottom():
@@ -891,16 +1184,18 @@ class LibraryView(QWidget):
         self.model.set_thumbnail(photo_id, pixmap)
 
     def _on_scan_finished(self, count: int):
-        self.status_label.setText(f"{count} photos")
+        self._scanning = False
+        self._update_status()
 
     def _on_scan_failed(self, error: str):
-        self.status_label.setText("Scan failed -- click Open Folder to retry")
+        self._scanning = False
+        self.status_label.setText("Scan failed -- click the folder to retry")
         QMessageBox.warning(
             self,
             "Scan Failed",
             f"Couldn't finish scanning this folder:\n\n{error}\n\n"
             "This is usually transient (e.g. another process briefly using the photo catalog). "
-            "Try Open Folder again -- your ratings and edits are untouched either way.\n\n"
+            "Click the folder in the sidebar to try again -- your ratings and edits are untouched either way.\n\n"
             f"Details were saved to {self.catalog.db_path.parent / 'logs' / 'catalog.log'}",
         )
 
@@ -1093,7 +1388,7 @@ class LibraryView(QWidget):
             if missing == failed:
                 message += (
                     " -- the files are no longer where the library last saw them. If the folder was "
-                    "renamed or moved after opening it, use Open Folder to reload it and try again."
+                    "renamed or moved after opening it, click it in the sidebar to reload it and try again."
                 )
             else:
                 message += f", for example:\n{example_error}"

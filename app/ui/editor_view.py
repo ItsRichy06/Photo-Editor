@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from .. import auto_enhance, image_io, processing, segmentation
 from ..settings import AUTO_ENHANCE_CONSENT, LAST_EXPORT_FOLDER, get_settings
-from . import widgets
+from . import theme, widgets
 
 PREVIEW_MAX_DIM = 2400  # long-edge px for the interactive-editing preview (full-res
 # only on export). Was 1400 -- fine for fitting a whole photo on screen, but
@@ -453,7 +453,7 @@ class ImageCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#202020"))
+        painter.fillRect(self.rect(), QColor("#0f0f0f"))  # same surround as the viewer
         if self._pixmap is None or self._pixmap.isNull():
             return
         ox, oy, _scale, dw, dh = self._compute_display_geometry()
@@ -1331,13 +1331,13 @@ class EditorView(QWidget):
         self._history_timer.timeout.connect(self._commit_history)
 
         main_layout = QVBoxLayout(self)
-        main_layout.addLayout(self._build_toolbar())
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        main_layout.addWidget(self._build_toolbar())
 
         body = QHBoxLayout()
-
-        info_panel = self._build_info_panel()
-        info_panel.setFixedWidth(230)
-        body.addWidget(info_panel, stretch=0)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
 
         self.canvas = ImageCanvas()
         self.canvas.cropPreviewChanged.connect(self._on_crop_preview_changed)
@@ -1360,94 +1360,73 @@ class EditorView(QWidget):
     # ---------------------------------------------------------------- toolbar
 
     def _build_toolbar(self):
-        bar = QHBoxLayout()
-        back_btn = QPushButton("← Library")
-        back_btn.clicked.connect(self.backRequested.emit)
-        bar.addWidget(back_btn)
+        widget = QWidget()
+        widget.setObjectName("editorHeader")
+        widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        widget.setStyleSheet(f"#editorHeader {{ background: {theme.PANEL}; border-bottom: 1px solid {theme.BORDER}; }}")
+        bar = QHBoxLayout(widget)
+        bar.setContentsMargins(10, 10, 16, 10)
+        bar.setSpacing(6)
 
-        self.filename_label = QLabel("")
-        bar.addWidget(self.filename_label)
+        def button(text, slot, tip=None, variant="ghost", width=None):
+            btn = QPushButton(text)
+            btn.setProperty("variant", variant)
+            if tip:
+                btn.setToolTip(tip)
+            if width:
+                btn.setFixedWidth(width)
+            btn.clicked.connect(slot)
+            bar.addWidget(btn)
+            return btn
+
+        button("‹  Library", self.backRequested.emit, "Back to the library")
+        bar.addSpacing(4)
+        bar.addWidget(self._build_info_panel())
         bar.addStretch(1)
 
-        undo_btn = QPushButton("Undo")
-        undo_btn.clicked.connect(self.undo)
-        bar.addWidget(undo_btn)
-        redo_btn = QPushButton("Redo")
-        redo_btn.clicked.connect(self.redo)
-        bar.addWidget(redo_btn)
-
-        self.compare_btn = QPushButton("Show Original")
+        button("Undo", self.undo, "Undo (Ctrl+Z)")
+        button("Redo", self.redo, "Redo (Ctrl+Y)")
+        bar.addSpacing(8)
+        self.compare_btn = button("Show Original", lambda: None, "Hold to compare with the unedited photo")
         self.compare_btn.setCheckable(True)
         self.compare_btn.toggled.connect(self._on_compare_toggle)
-        bar.addWidget(self.compare_btn)
-
-        zoom_out_btn = QPushButton("−")
-        zoom_out_btn.setFixedWidth(28)
-        zoom_out_btn.setToolTip("Zoom Out")
-        zoom_out_btn.clicked.connect(lambda: self.canvas.zoom_out())
-        bar.addWidget(zoom_out_btn)
-
-        self.zoom_label = QPushButton("Fit")
-        self.zoom_label.setFixedWidth(56)
-        self.zoom_label.setToolTip("Click to reset to Fit")
-        self.zoom_label.clicked.connect(lambda: self.canvas.zoom_to_fit())
-        bar.addWidget(self.zoom_label)
-
-        zoom_in_btn = QPushButton("+")
-        zoom_in_btn.setFixedWidth(28)
-        zoom_in_btn.setToolTip("Zoom In")
-        zoom_in_btn.clicked.connect(lambda: self.canvas.zoom_in())
-        bar.addWidget(zoom_in_btn)
-
-        zoom_100_btn = QPushButton("100%")
-        zoom_100_btn.setToolTip("Actual Size")
-        zoom_100_btn.clicked.connect(lambda: self.canvas.zoom_to_actual())
-        bar.addWidget(zoom_100_btn)
-
-        export_btn = QPushButton("Export…")
-        export_btn.clicked.connect(self.export_photo)
-        bar.addWidget(export_btn)
-        return bar
+        bar.addSpacing(8)
+        button("−", lambda: self.canvas.zoom_out(), "Zoom out", width=32)
+        self.zoom_label = button("Fit", lambda: self.canvas.zoom_to_fit(), "Click to fit the photo to the window", width=60)
+        button("+", lambda: self.canvas.zoom_in(), "Zoom in", width=32)
+        button("100%", lambda: self.canvas.zoom_to_actual(), "Actual size")
+        bar.addSpacing(10)
+        button("Export…", self.export_photo, "Save an edited copy", variant="primary")
+        return widget
 
     # -------------------------------------------------------------- info panel
 
     def _build_info_panel(self):
-        box = QGroupBox("Photo Info")
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(3)
+        """Photo name and shooting info, as one line in the top bar. Lens,
+        date and dimensions are in its tooltip. (This used to be a 230px
+        left-hand column holding about six short lines.)"""
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
 
         self.info_filename = QLabel("")
-        self.info_filename.setWordWrap(True)
-        self.info_filename.setStyleSheet("font-weight: 600; font-size: 12px;")
+        self.info_filename.setProperty("role", "title")
         layout.addWidget(self.info_filename)
 
         self.info_camera = QLabel("")
-        self.info_camera.setWordWrap(True)
-        self.info_camera.setStyleSheet("color: #cccccc; font-size: 11px;")
+        self.info_camera.setProperty("role", "muted")
         layout.addWidget(self.info_camera)
 
-        self.info_lens = QLabel("")
-        self.info_lens.setWordWrap(True)
-        self.info_lens.setStyleSheet("color: #999999; font-size: 11px;")
-        layout.addWidget(self.info_lens)
-
         self.info_exposure = QLabel("")
-        self.info_exposure.setWordWrap(True)
-        self.info_exposure.setStyleSheet("color: #eeeeee; font-size: 13px; font-weight: 600; padding-top: 6px;")
+        self.info_exposure.setProperty("role", "muted")
         layout.addWidget(self.info_exposure)
 
+        # Kept as labels (other code and tests read them), shown via tooltip.
+        self.info_lens = QLabel("")
         self.info_date = QLabel("")
-        self.info_date.setWordWrap(True)
-        self.info_date.setStyleSheet("color: #999999; font-size: 11px; padding-top: 4px;")
-        layout.addWidget(self.info_date)
-
         self.info_dimensions = QLabel("")
-        self.info_dimensions.setWordWrap(True)
-        self.info_dimensions.setStyleSheet("color: #999999; font-size: 11px;")
-        layout.addWidget(self.info_dimensions)
-
-        layout.addStretch(1)
+        self._info_box = box
         return box
 
     @staticmethod
@@ -1473,7 +1452,6 @@ class EditorView(QWidget):
 
         lens = summary.get("lens")
         self.info_lens.setText(lens or "")
-        self.info_lens.setVisible(bool(lens))
 
         parts = []
         if summary.get("aperture"):
@@ -1484,15 +1462,16 @@ class EditorView(QWidget):
             parts.append(f"ISO {int(summary['iso'])}")
         if summary.get("focal_length"):
             parts.append(f"{summary['focal_length']:.0f}mm")
-        self.info_exposure.setText("   ".join(parts) if parts else "No shooting data found")
+        self.info_exposure.setText("  ·  ".join(parts) if parts else "No shooting data found")
 
         date = summary.get("date")
         self.info_date.setText(date or "")
-        self.info_date.setVisible(bool(date))
 
         w, h = summary.get("width"), summary.get("height")
         fmt = "RAW" if image_io.is_raw(path) else "JPEG"
         self.info_dimensions.setText(f"{w} × {h} · {fmt}" if w and h else fmt)
+        self._info_box.setToolTip("\n".join(t for t in (
+            Path(path).name, summary.get("camera"), lens, date, self.info_dimensions.text()) if t))
 
     # ------------------------------------------------------- adjustment panel
 
@@ -1588,7 +1567,13 @@ class EditorView(QWidget):
         layout.addStretch(1)
 
         scroll = QScrollArea()
+        scroll.setObjectName("adjustPanel")
         scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            f"#adjustPanel {{ background: {theme.PANEL}; border: none; border-left: 1px solid {theme.BORDER}; }}"
+            f"#adjustPanel > QWidget > QWidget {{ background: {theme.PANEL}; }}"
+        )
+        layout.setContentsMargins(14, 10, 12, 14)
         scroll.setWidget(panel)
         return scroll
 
@@ -1700,7 +1685,7 @@ class EditorView(QWidget):
     def open_photo(self, photo_id: int, path: str):
         self.photo_id = photo_id
         self.path = path
-        self.filename_label.setText(Path(path).name)
+        self.info_filename.setText(Path(path).name)
         self._orig_dims = image_io.get_dimensions(path)
         self.preview_source = image_io.load_preview_float(path, max_dim=PREVIEW_MAX_DIM)
         self.canvas.reset_view()
