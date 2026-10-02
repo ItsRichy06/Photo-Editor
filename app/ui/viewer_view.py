@@ -470,7 +470,7 @@ class PhotoViewerView(QWidget):
         layout.addWidget(self.rating_widget)
 
         layout.addSpacing(8)
-        self.delete_btn = QPushButton("Delete Photo…")
+        self.delete_btn = QPushButton("Delete Photo")
         self.delete_btn.setProperty("variant", "danger")
         self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.delete_btn.setFixedHeight(34)

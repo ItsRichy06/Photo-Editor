@@ -20,7 +20,9 @@ import send2trash
 from PySide6.QtCore import (
     QAbstractListModel,
     QEvent,
+    QItemSelection,
     QModelIndex,
+    QPersistentModelIndex,
     QPoint,
     QPointF,
     QRect,
@@ -236,6 +238,7 @@ class PhotoFilterProxy(QSortFilterProxyModel):
         self.kind_filter = "all"  # "all" | "focus" | "hdr" | "originals"
         self.search_text = ""
         self.sort_mode = "name"
+        self.sort_descending = False
         self.setDynamicSortFilter(True)
 
     def set_rating_filter(self, rating: int):
@@ -264,8 +267,29 @@ class PhotoFilterProxy(QSortFilterProxyModel):
         self.search_text = text.strip().lower()
         self.invalidateFilter()
 
+    # Each sort starts in the direction people usually want it.
+    DEFAULT_DESCENDING = {"name": False, "date": True, "rating": True, "resolution": True}
+    DIRECTION_LABELS = {
+        "name": ("A → Z", "Z → A"),
+        "date": ("Oldest first", "Newest first"),
+        "rating": ("Lowest first", "Highest first"),
+        "resolution": ("Smallest first", "Largest first"),
+    }
+
     def set_sort_mode(self, mode: str):
         self.sort_mode = mode
+        self.sort_descending = self.DEFAULT_DESCENDING.get(mode, False)
+        self._resort()
+
+    def set_sort_descending(self, descending: bool):
+        self.sort_descending = descending
+        self._resort()
+
+    def direction_label(self) -> str:
+        asc, desc = self.DIRECTION_LABELS.get(self.sort_mode, ("Ascending", "Descending"))
+        return desc if self.sort_descending else asc
+
+    def _resort(self):
         self.invalidate()
         self.sort(0)
 
@@ -296,21 +320,28 @@ class PhotoFilterProxy(QSortFilterProxyModel):
                 return False
         return True
 
+    _SORT_ROLES = {"date": PhotoListModel.MtimeRole, "rating": PhotoListModel.RatingRole,
+                   "resolution": PhotoListModel.PixelsRole}
+
     def lessThan(self, left, right):
-        if self.sort_mode == "date":
-            return (left.data(PhotoListModel.MtimeRole) or 0) < (right.data(PhotoListModel.MtimeRole) or 0)
+        """Always called with Qt's ascending order; the chosen direction is
+        applied here instead, so ties can fall back to filename A-Z in both
+        directions (Qt's own descending order would reverse those too)."""
+        lname = (left.data(PhotoListModel.NameRole) or "").lower()
+        rname = (right.data(PhotoListModel.NameRole) or "").lower()
+        role = self._SORT_ROLES.get(self.sort_mode)
+        if role is None:  # name
+            return lname > rname if self.sort_descending else lname < rname
+        lk, rk = left.data(role), right.data(role)
         if self.sort_mode == "rating":
-            return (left.data(PhotoListModel.RatingRole) or 0) > (right.data(PhotoListModel.RatingRole) or 0)
-        if self.sort_mode == "resolution":
-            # Largest first (e.g. a phone's 50MP mode ahead of its 12MP
-            # default); unknown dimensions last; same size falls back to
-            # name so equal-resolution photos keep a stable order.
-            lp = left.data(PhotoListModel.PixelsRole) or -1
-            rp = right.data(PhotoListModel.PixelsRole) or -1
-            if lp != rp:
-                return lp > rp
-            return (left.data(PhotoListModel.NameRole) or "").lower() < (right.data(PhotoListModel.NameRole) or "").lower()
-        return (left.data(PhotoListModel.NameRole) or "").lower() < (right.data(PhotoListModel.NameRole) or "").lower()
+            lk, rk = lk or 0, rk or 0
+        if lk != rk:
+            # Unknown values (e.g. a photo whose dimensions couldn't be
+            # read) go last whichever way the sort runs.
+            if lk is None or rk is None:
+                return rk is None
+            return lk > rk if self.sort_descending else lk < rk
+        return lname < rname
 
 
 class PhotoDelegate(QStyledItemDelegate):
@@ -659,6 +690,52 @@ class AutoRateThread(QThread):
         self.finished_rating.emit(rated_count, failed, missing, example_error)
 
 
+class PhotoGridView(QListView):
+    """A QListView whose range selection runs in reading order.
+
+    Qt's icon mode selects a range as a rectangle: Shift-click (or a drag
+    from a photo) selects whatever intersects the box between the two
+    points, so across rows you'd get a block of columns rather than every
+    photo in between -- and within one row the two happen to agree, which
+    is why it looked right only some of the time. Here a range is every row
+    of the (filtered, sorted) list from the anchor to the target. Dragging
+    from empty space keeps the rubber-band rectangle, the usual explicit
+    gesture for one."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._anchor = QPersistentModelIndex()
+        self._pointer = None  # position of the mouse event driving the selection, or None for keyboard
+
+    def mousePressEvent(self, event):
+        index = self.indexAt(event.position().toPoint())
+        if not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self._anchor = QPersistentModelIndex(index)  # invalid when pressing on empty space
+        self._pointer = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self._pointer = event.position().toPoint()
+        super().mouseMoveEvent(event)
+
+    def keyPressEvent(self, event):
+        self._pointer = None
+        super().keyPressEvent(event)
+        if not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self._anchor = QPersistentModelIndex(self.currentIndex())
+
+    def setSelection(self, rect, command):
+        end = self.indexAt(self._pointer) if self._pointer is not None else self.currentIndex()
+        anchor = QModelIndex(self._anchor) if self._anchor.isValid() else None
+        if anchor is None or not anchor.isValid():
+            return super().setSelection(rect, command)  # rubber band from empty space
+        if not end.isValid():
+            return  # dragged over a gap between cards: keep the current range
+        lo, hi = sorted((anchor.row(), end.row()))
+        model = self.model()
+        self.selectionModel().select(QItemSelection(model.index(lo, 0), model.index(hi, 0)), command)
+
+
 def _filter_combo(items, tooltip, min_width=96) -> QComboBox:
     combo = QComboBox()
     combo.addItems(items)
@@ -738,26 +815,32 @@ class LibraryView(QWidget):
             title_row.addWidget(btn)
             return btn
 
+        # Shown only while exactly one photo is selected (see
+        # _update_selection_actions); it sits leftmost so the buttons after it
+        # don't shift when it appears.
+        self.edit_btn = action_button("Edit", "Open the selected photo in the editor (E)", self._edit_current, "primary")
+        self.edit_btn.setVisible(False)
         self.group_btn = action_button(
-            "Group into Folder…",
+            "Group into Folder",
             "Move the selected photos into a new folder inside this one (Ctrl+G). RAW+JPEG pairs move together.",
             self._on_group_into_folder,
         )
         self.stack_btn = action_button(
-            "Stack Photos…",
+            "Stack Photos",
             "Select 2+ photos, then auto-detect and merge HDR exposure brackets and focus stacks among them.",
             self._on_stack_photos,
         )
         self.auto_rate_btn = action_button(
-            "Auto-Rate…",
+            "Auto-Rate",
             "Give every photo with no star rating yet a rough 1-5 rating from automatic sharpness/exposure "
             "detection. Never touches a photo you've already rated by hand.",
             self._on_auto_rate_clicked,
         )
         self.delete_btn = action_button(
-            "Delete…",
+            "Delete",
             "Send the selected photos to the Recycle Bin (Del) -- recoverable there afterward.",
             self._on_delete_selected,
+            "danger",
         )
         header_layout.addLayout(title_row)
 
@@ -811,9 +894,17 @@ class LibraryView(QWidget):
         )
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         filter_row.addWidget(self.sort_combo)
+        self.sort_dir_btn = QPushButton()
+        self.sort_dir_btn.setToolTip("Flip the sort direction")
+        self.sort_dir_btn.setMinimumWidth(96)
+        self.sort_dir_btn.clicked.connect(
+            lambda: (self.proxy.set_sort_descending(not self.proxy.sort_descending), self._update_sort_button())
+        )
+        filter_row.addWidget(self.sort_dir_btn)
+        self._update_sort_button()
         header_layout.addLayout(filter_row)
 
-        self.list_view = QListView()
+        self.list_view = PhotoGridView()
         self.list_view.setModel(self.proxy)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
         self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
@@ -906,7 +997,7 @@ class LibraryView(QWidget):
         layout.addWidget(hint)
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
-        add = QPushButton("Add Folder…")
+        add = QPushButton("Add Folder")
         add.setProperty("variant", "primary")
         add.clicked.connect(self.choose_folder)
         btn_row.addWidget(add)
@@ -956,6 +1047,7 @@ class LibraryView(QWidget):
 
     def _update_selection_actions(self):
         n = len(self._selected_indexes())
+        self.edit_btn.setVisible(n == 1)
         self.group_btn.setEnabled(n > 0)
         self.delete_btn.setEnabled(n > 0)
         self.stack_btn.setEnabled(n > 1)
@@ -1030,12 +1122,12 @@ class LibraryView(QWidget):
         add("Reject", lambda: self._flag_selected("reject"), "X")
         add("Clear Flag", lambda: self._flag_selected("none"), "U")
         menu.addSeparator()
-        add("Group into Folder…", self._on_group_into_folder, "Ctrl+G")
-        add("Stack Photos…", self._on_stack_photos, enabled=n > 1)
+        add("Group into Folder", self._on_group_into_folder, "Ctrl+G")
+        add("Stack Photos", self._on_stack_photos, enabled=n > 1)
         if n == 1:
             add("Show in Explorer", lambda: _show_in_explorer(index.data(PhotoListModel.PathRole)))
         menu.addSeparator()
-        add(f"Delete {n} Photo{'s' if n != 1 else ''}…", self._on_delete_selected, "Del")
+        add(f"Delete {n} Photo{'s' if n != 1 else ''}", self._on_delete_selected, "Del")
         menu.exec(self.list_view.viewport().mapToGlobal(pos))
 
     def choose_folder(self):
@@ -1417,3 +1509,8 @@ class LibraryView(QWidget):
 
     def _on_sort_changed(self, idx: int):
         self.proxy.set_sort_mode({0: "name", 1: "date", 2: "rating", 3: "resolution"}.get(idx, "name"))
+        self._update_sort_button()
+
+    def _update_sort_button(self):
+        self.sort_dir_btn.setText(self.proxy.direction_label())
+        self.sort_dir_btn.setIcon(theme.icon("arrow_down" if self.proxy.sort_descending else "arrow_up"))

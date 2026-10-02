@@ -271,7 +271,7 @@ class FolderSidebar(QWidget):
         item = self.tree.itemAt(pos)
         if item is None:
             menu = QMenu(self)
-            menu.addAction("Add Folder…", self.choose_and_add)
+            menu.addAction("Add Folder", self.choose_and_add)
             menu.exec(self.tree.viewport().mapToGlobal(pos))
             return
         path = item.data(0, PATH_ROLE)

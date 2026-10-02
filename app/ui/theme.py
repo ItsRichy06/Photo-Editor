@@ -260,17 +260,38 @@ QListWidget::item:selected, QListView::item:selected {{
     background: {ACCENT_DIM};
     color: #ffffff;
 }}
+/* show-decoration-selected stays 0 and ::branch stays transparent: if the
+   branch strip (left of the item, where the expand arrow sits) takes the
+   selection color too, it's painted as its own square block next to the
+   item's rounded highlight -- a visible notch. Styling ::branch at all also
+   switches off Qt's own expand arrows, hence the explicit chevrons. */
 QTreeView, QTreeWidget {{
     background: transparent;
     border: none;
     outline: none;
     color: {TEXT};
-    show-decoration-selected: 1;
+    show-decoration-selected: 0;
 }}
+QTreeView::branch {{
+    background: transparent;
+    border: none;
+}}
+QTreeView::branch:selected {{
+    background: {ACCENT_DIM};
+}}
+QTreeView::branch:has-children:closed {{
+    image: url({_asset_url("chevron_right.png")});
+}}
+QTreeView::branch:has-children:open {{
+    image: url({_asset_url("chevron_down.png")});
+}}
+/* No border-radius here: Qt paints the row's highlight in two pieces (the
+   branch strip and the item), and rounding each piece separately is what
+   produced the notch next to the selected folder. Square-cornered, the two
+   pieces join into one continuous bar. */
 QTreeView::item {{
     min-height: 28px;
     padding-left: 2px;
-    border-radius: 5px;
 }}
 QTreeView::item:hover {{
     background: {SURFACE_HOVER};

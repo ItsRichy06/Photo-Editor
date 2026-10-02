@@ -29,6 +29,26 @@ def chevron_down(d, w, h):
     d.line(pts, fill=COLOR, width=stroke, joint="curve")
 
 
+def chevron_right(d, w, h):
+    stroke = max(1, round(w * 0.26))
+    pts = [(stroke * 0.6, stroke * 0.6), (w - stroke * 0.7, h / 2), (stroke * 0.6, h - stroke * 0.6)]
+    d.line(pts, fill=COLOR, width=stroke, joint="curve")
+
+
+def arrow_up(d, w, h):
+    stroke = max(1, round(w * 0.14))
+    cx = w / 2
+    d.line((cx, stroke, cx, h - stroke * 0.5), fill=COLOR, width=stroke)
+    d.line([(w * 0.18, h * 0.42), (cx, stroke * 0.7), (w * 0.82, h * 0.42)], fill=COLOR, width=stroke, joint="curve")
+
+
+def arrow_down(d, w, h):
+    stroke = max(1, round(w * 0.14))
+    cx = w / 2
+    d.line((cx, stroke * 0.5, cx, h - stroke), fill=COLOR, width=stroke)
+    d.line([(w * 0.18, h * 0.58), (cx, h - stroke * 0.7), (w * 0.82, h * 0.58)], fill=COLOR, width=stroke, joint="curve")
+
+
 def search(d, w, h):
     stroke = max(1, round(w * 0.12))
     r = w * 0.32
@@ -39,5 +59,8 @@ def search(d, w, h):
 
 if __name__ == "__main__":
     _save("chevron_down", (10, 6), chevron_down)
+    _save("chevron_right", (6, 10), chevron_right)
+    _save("arrow_up", (12, 14), arrow_up)
+    _save("arrow_down", (12, 14), arrow_down)
     _save("search", (14, 14), search)
-    print("wrote chevron_down(@2x).png, search(@2x).png")
+    print("wrote chevron_down, chevron_right, arrow_up, arrow_down, search (1x + @2x)")

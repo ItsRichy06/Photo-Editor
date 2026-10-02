@@ -1396,7 +1396,7 @@ class EditorView(QWidget):
         button("+", lambda: self.canvas.zoom_in(), "Zoom in", width=32)
         button("100%", lambda: self.canvas.zoom_to_actual(), "Actual size")
         bar.addSpacing(10)
-        button("Export…", self.export_photo, "Save an edited copy", variant="primary")
+        button("Export", self.export_photo, "Save an edited copy", variant="primary")
         return widget
 
     # -------------------------------------------------------------- info panel
