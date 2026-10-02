@@ -18,6 +18,31 @@ git commits.
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-10-02
+### Added
+- A folder sidebar in the library: your photo folders and their
+  subfolders, one click to switch, "+" to add one. No more Open Folder
+  dialog every time. It starts out with the folders you've already used.
+- Group into Folder (Ctrl+G or right-click): moves the selected photos
+  into a new subfolder on disk, which shows up in Explorer too. RAW+JPEG
+  pairs move together even if only one half is selected, ratings and
+  edits come along, and nothing is ever overwritten.
+- A right-click menu on photos: view, edit, rate, pick/reject, group,
+  stack, Show in Explorer, delete. Rating and pick/reject now apply to
+  every selected photo, not just the first.
+- In the large view, double-click the photo or press E to edit it.
+### Changed
+- A consistent look across the library, large view and editor: one
+  accent color, one style of button, dropdown and text field. The
+  dropdowns were rounded on one side and square on the other; that's
+  fixed.
+- The library's toolbar is now a header with the folder name, photo and
+  selection counts, plus one row of filters; the photo grid fills the
+  window's width at any size.
+- The editor's photo info moved from a mostly empty left column into the
+  top bar, giving the photo more room.
+- The app now fits narrower screens (down to about 950 px wide).
+
 ## [1.18.0] - 2026-10-01
 ### Added
 - Sort the library by Resolution (megapixels, largest first) -- e.g. to
