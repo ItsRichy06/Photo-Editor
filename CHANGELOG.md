@@ -18,6 +18,21 @@ git commits.
 
 ## [Unreleased]
 
+## [1.19.1] - 2026-10-02
+### Added
+- Sort direction: the button next to the sort menu shows which way it
+  runs ("Highest first", "Largest first", "Newest first", "A → Z") and
+  flips it with a click.
+- An Edit button in the library header while one photo is selected.
+### Fixed
+- Shift-click (and dragging) now selects every photo between the two
+  you click, in order, instead of sometimes a rectangle of columns.
+- The selected folder in the sidebar had a small notch at its left edge;
+  folders with subfolders now show an arrow to expand them.
+### Changed
+- Delete is red and Edit is blue in the library, matching the large
+  view, and button labels no longer end in "…".
+
 ## [1.19.0] - 2026-10-02
 ### Added
 - A folder sidebar in the library: your photo folders and their
