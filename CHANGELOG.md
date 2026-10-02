@@ -18,6 +18,13 @@ git commits.
 
 ## [Unreleased]
 
+## [1.19.3] - 2026-10-02
+### Added
+- Move to (right-click): move the selected photos to any folder -- the
+  ones in your sidebar, or anywhere else via Choose Folder -- e.g. to
+  gather picks from several folders into one "To edit" folder. Pairs move
+  together, ratings and edits follow, nothing is overwritten.
+
 ## [1.19.2] - 2026-10-02
 ### Fixed
 - The library's Delete button looked active (bright red) even when it
