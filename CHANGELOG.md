@@ -18,6 +18,12 @@ git commits.
 
 ## [Unreleased]
 
+## [1.19.2] - 2026-10-02
+### Fixed
+- The library's Delete button looked active (bright red) even when it
+  was disabled because nothing was selected; it now dims like the other
+  buttons.
+
 ## [1.19.1] - 2026-10-02
 ### Added
 - Sort direction: the button next to the sort menu shows which way it
