@@ -9,6 +9,7 @@ ratings, flags and edits follow the file.
 """
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -77,7 +78,12 @@ def move_into_folder(photo_paths, dest_dir, catalog) -> MoveResult:
             continue
         try:
             st = src.stat()
-            os.rename(src, dst)  # same volume (a subfolder) -> a fast rename; never overwrites on Windows
+            try:
+                os.rename(src, dst)  # same drive: a fast rename; never overwrites on Windows
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 17:  # 17 = different drive
+                    raise
+                shutil.move(str(src), str(dst))  # copy + delete; dst was checked free above
         except OSError as exc:
             result.skipped.append((str(src), str(exc)))
             continue

@@ -58,6 +58,7 @@ from .. import image_io, organize, quality, thumbnails
 from ..settings import LAST_LIBRARY_FOLDER, get_settings
 from . import stacking_dialogs, theme, widgets
 from .folder_sidebar import FolderSidebar, _show_in_explorer
+from .folder_sidebar import _subfolders as fs_subfolders
 
 THUMB_SIZE = 320
 # Grid cells are sized to fill the view's width (LibraryView._update_cell_size):
@@ -1123,6 +1124,16 @@ class LibraryView(QWidget):
         add("Clear Flag", lambda: self._flag_selected("none"), "U")
         menu.addSeparator()
         add("Group into Folder", self._on_group_into_folder, "Ctrl+G")
+        move = menu.addMenu("Move to")
+        for folder in self.sidebar.folders():
+            targets = [Path(folder)] + fs_subfolders(Path(folder))
+            for t in targets:
+                label = t.name if t == Path(folder) else f"    {t.name}"
+                act = move.addAction(label, lambda _=False, d=str(t): self._move_selected_to(d))
+                act.setToolTip(str(t))
+                act.setEnabled(t.is_dir())
+        move.addSeparator()
+        move.addAction("Choose Folder…", self._choose_move_target)
         add("Stack Photos", self._on_stack_photos, enabled=n > 1)
         if n == 1:
             add("Show in Explorer", lambda: _show_in_explorer(index.data(PhotoListModel.PathRole)))
@@ -1181,6 +1192,41 @@ class LibraryView(QWidget):
             )
         self.sidebar.refresh(str(parent))
         self.load_folder(str(parent))
+
+    # ------------------------------------------------------------ move to
+
+    def _choose_move_target(self):
+        from PySide6.QtWidgets import QFileDialog
+
+        start = self.current_folder or str(Path.home() / "Pictures")
+        folder = QFileDialog.getExistingDirectory(self, "Move photos to folder", start)
+        if folder:
+            self._move_selected_to(folder)
+
+    def _move_selected_to(self, dest: str):
+        """Move the selection to any folder -- e.g. gather picks from
+        several folders into one "To edit" folder. Same rules as Group into
+        Folder: pairs move together, ratings/edits follow, never overwrites."""
+        photos = self._selected_photos()
+        if not photos:
+            return
+        dest = Path(dest)
+        result = organize.move_into_folder([p["path"] for p in photos], dest, self.catalog)
+        if result.skipped:
+            lines = "\n".join(f"  {Path(p).name}: {why}" for p, why in result.skipped[:8])
+            more = f"\n  …and {len(result.skipped) - 8} more" if len(result.skipped) > 8 else ""
+            QMessageBox.warning(
+                self, "Move to Folder",
+                f"Moved {result.photo_count} file{'s' if result.photo_count != 1 else ''} to “{dest.name}”. "
+                f"{len(result.skipped)} couldn't be moved and were left where they were:\n{lines}{more}",
+            )
+        if self.sidebar._find_item(str(dest)) is None and not any(
+                str(dest).lower().startswith(f.lower()) for f in self.sidebar.folders()):
+            self.sidebar.add_folder(str(dest))  # so the destination is one click away
+        for f in self.sidebar.folders():
+            self.sidebar.refresh(f)
+        if self.current_folder:
+            self.load_folder(self.current_folder)
 
     def _retire_loader_thread(self, thread: "ThumbnailLoaderThread"):
         """Ask a superseded loader thread to stop and detach it from the UI,
