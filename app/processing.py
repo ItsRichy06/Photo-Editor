@@ -268,22 +268,40 @@ def _denoise_lab(lab, t, scale):
     the fine chroma band by the same amount."""
     L, a, b = (np.ascontiguousarray(lab[..., i]) for i in range(3))
     sig_l = _noise_sigma(L)
-    sig_c = max(_noise_sigma(a), _noise_sigma(b))
+    # Chroma noise is measured at half size too: JPEG stores colour at half
+    # resolution, so its colour noise is blotchy and nearly invisible to a
+    # pixel-scale estimator (x2 restores white noise's full-size level).
+    half = (max(1, a.shape[1] // 2), max(1, a.shape[0] // 2))
+    sig_c = max(max(_noise_sigma(c), 2.0 * _noise_sigma(cv2.resize(c, half, interpolation=cv2.INTER_AREA))) for c in (a, b))
     # Luma: NLM, its strength set from the measured grain so 100 means
-    # "remove about all of it" whether the photo is ISO 100 or ISO 6400.
-    h = t * min(max(sig_l * 2.55 * 1.6, 3.0), 30.0)
-    l8 = np.clip(L * 2.55, 0, 255).astype(np.uint8)
-    L = cv2.fastNlMeansDenoising(l8, None, h, 7, 21).astype(np.float32) / 2.55
+    # "remove most of it" whether the photo is ISO 100 or ISO 6400. h at
+    # 1x the grain, not more: at 1.6x it smudged the craters on a high-ISO
+    # moon shot along with the grain.
+    h = t * min(max(sig_l * 2.55, 2.0), 20.0)
+    l8 = np.clip(np.rint(L * 2.55), 0, 255).astype(np.uint8)
+    # Add back the 8-bit rounding error so smooth gradients don't band.
+    L = cv2.fastNlMeansDenoising(l8, None, h, 7, 21).astype(np.float32) / 2.55 + (L - l8.astype(np.float32) / 2.55)
     # Chroma: high-ISO colour noise is coarse red/blue blotching that a 7px
     # NLM patch can't see, so smooth a/b over a wide radius instead, guided
     # by luma. Scaled by how much colour noise there actually is, so a clean
     # photo's faint colour detail (thin pink clouds...) is left alone.
     w = t * min(max((sig_c - 0.5) / 3.0, 0.0), 1.0)
     if w > 0:
-        r = max(1, int(round((2 + 14 * t) * scale)))
+        r = max(1, int(round((2 + 8 * t) * scale)))
         eps = (max(sig_l, 0.5) * 2.0) ** 2
         a = a + w * (_guided_filter(L, a, r, eps) - a)
         b = b + w * (_guided_filter(L, b, r, eps) - b)
+        # Near black, a high-ISO RAW's colour is mostly noise clipped at
+        # zero, which averages out to a red/magenta cast (R and B carry the
+        # bigger white-balance gains). Grain hid it; smoothed, a night sky
+        # turned solid maroon. Fade chroma to neutral where the signal is
+        # within a few grain-widths of black (real dark colour -- blue water
+        # at dusk -- sits well above that and keeps its colour).
+        lo, hi = 2.0 * sig_l, 5.0 * sig_l
+        s = np.clip((L - lo) / max(hi - lo, 1e-3), 0.0, 1.0)
+        keep = 1.0 - w * (1.0 - s * s * (3.0 - 2.0 * s))
+        a = a * keep
+        b = b * keep
     return cv2.merge([L, a, b]), w
 
 

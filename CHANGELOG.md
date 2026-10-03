@@ -22,10 +22,12 @@ git commits.
 ### Fixed
 - Denoise did next to nothing on high-ISO photos: the red/blue colour
   blotching in a dark night sky was untouched even at 100. It now treats
-  colour noise and grain separately, sets its strength from how noisy the
-  photo actually is (so a clean photo's colours aren't smeared), runs
-  before Sharpen instead of after it, and an exported full-size photo now
-  comes out as clean as the preview showed.
+  colour noise and grain separately and sets its strength from how noisy
+  the photo actually is, so craters on a moon shot keep their detail and a
+  clean photo's colours aren't smeared. In near-black areas it also
+  removes the red cast that high-ISO RAW noise leaves behind (a night sky
+  goes neutral instead of maroon). It runs before Sharpen instead of after
+  it, and an exported full-size photo comes out as clean as the preview.
 
 ## [1.19.3] - 2026-10-02
 ### Added
