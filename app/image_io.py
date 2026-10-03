@@ -10,6 +10,7 @@ import struct
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import numpy as np
 import rawpy
 from PIL import Image, ExifTags, ImageOps, TiffImagePlugin
@@ -51,6 +52,97 @@ def get_dimensions(path) -> tuple[int, int]:
         return (h, w) if orientation in (5, 6, 7, 8) else (w, h)
 
 
+# ------------------------------------------------------------ RAW rendering
+#
+# RAWs are decoded linear and brightened to match the camera's own embedded
+# JPEG, not with LibRaw's auto-brightness. That brightened every photo until
+# its top 1% of pixels clipped, which swings wildly with content: ~1x on a
+# bright scene, 10-20x on a night shot. A crescent moon (about 1% of the
+# frame) came out solid white with a maroon, grain-filled sky, where the
+# camera JPEG -- and Luminar -- show a grey moon on black. The camera's
+# brightness, by contrast, is steady (x2.3-3.4 across this library), so
+# matching it respects the exposure as shot, and the editor opens looking
+# like the library/viewer, which already show that embedded JPEG.
+
+_LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
+_MATCH_PERCENTILES = np.array([50, 60, 70, 80, 85, 90, 93, 95, 97, 98, 99, 99.3, 99.5, 99.7, 99.85])
+_FALLBACK_GAIN = 2.5  # typical camera-JPEG gain, for a RAW with no usable preview
+_SHOULDER_KNEE = 0.6  # linear level where highlights start rolling off (~0.8 on screen)
+
+
+def _bt709(x):
+    """LibRaw's default output curve (gamma 2.222, toe slope 4.5) -- kept so
+    tones look the way RAWs always have here, only the brightness changed."""
+    x = np.maximum(x, 0.0)
+    return np.where(x < 0.018, 4.5 * x, 1.099 * np.power(x, 0.45) - 0.099)
+
+
+def _bt709_inv(y):
+    y = np.maximum(y, 0.0)
+    return np.where(y < 0.081, y / 4.5, np.power((y + 0.099) / 1.099, 1 / 0.45))
+
+
+def _embedded_preview_luma(raw):
+    """Luma of the camera's embedded preview, decoded small, or None."""
+    try:
+        thumb = raw.extract_thumb()
+    except rawpy.LibRawError:
+        return None
+    if thumb.format == rawpy.ThumbFormat.JPEG:
+        try:
+            img = Image.open(io.BytesIO(thumb.data))
+            img.draft("RGB", (800, 800))
+            arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+        except OSError:
+            return None
+    elif thumb.format == rawpy.ThumbFormat.BITMAP:
+        data = np.asarray(thumb.data)
+        arr = data.astype(np.float32) / (65535.0 if data.dtype == np.uint16 else 255.0)
+    else:
+        return None
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        return None
+    return arr[..., :3].reshape(-1, 3) @ _LUMA
+
+
+def _camera_matched_gain(lin_sample, preview_luma) -> float:
+    """Linear gain that puts this decode's brightness where the camera's
+    JPEG has it: for each brightness percentile that's neither black nor
+    blown in the JPEG, the gain mapping our level onto the JPEG's through
+    the output curve; the median of those. Percentiles, not pixels, so the
+    preview's size, crop and orientation don't matter. A moon shot only has
+    valid percentiles on the moon itself, so the moon is what gets matched."""
+    if preview_luma is None or preview_luma.size == 0:
+        return _FALLBACK_GAIN
+    jq = np.percentile(preview_luma, _MATCH_PERCENTILES)
+    yq = np.percentile(lin_sample.reshape(-1, 3) @ _LUMA, _MATCH_PERCENTILES)
+    ok = (jq > 0.06) & (jq < 0.9) & (yq > 1e-5)
+    if ok.sum() < 3:
+        return _FALLBACK_GAIN
+    return float(np.clip(np.median(_bt709_inv(jq[ok]) / yq[ok]), 0.5, 16.0))
+
+
+def _render_raw(rgb16, preview_luma) -> np.ndarray:
+    """Linear 16-bit decode -> display float32 [0, 1] through one 64K-entry
+    lookup table: gain, a highlight shoulder, then the output curve.
+    Everything the sensor recorded rolls off smoothly into white instead of
+    clipping, so highlight detail (the moon, a bright sky) survives."""
+    sample = rgb16[::4, ::4].astype(np.float32) / 65535.0
+    gain = _camera_matched_gain(sample, preview_luma)
+    x = np.arange(65536, dtype=np.float32) * (gain / 65535.0)
+    # Roll [knee, brightest real highlight] off into [knee, 1] -- extended
+    # Reinhard, slope 1 at the knee so there's no visible kink. The top
+    # 0.01% is let clip, so one specular glint can't dull every highlight.
+    xmax = gain * float(np.quantile(sample.max(axis=2), 0.9999))
+    k = _SHOULDER_KNEE
+    if xmax > 1.0:
+        w = (xmax - k) / (1.0 - k)
+        u = np.maximum(x - k, 0.0) / (1.0 - k)
+        x = np.where(x > k, k + (1.0 - k) * u * (1.0 + u / (w * w)) / (1.0 + u), x)
+    lut = _bt709(np.minimum(x, 1.0)).astype(np.float32)
+    return lut[rgb16]
+
+
 def load_image_float(path, half_size: bool = False) -> np.ndarray:
     """Full decode -> HxWx3 float32 array in [0, 1]."""
     path = str(path)
@@ -58,19 +150,13 @@ def load_image_float(path, half_size: bool = False) -> np.ndarray:
         with rawpy.imread(path) as raw:
             rgb16 = raw.postprocess(
                 use_camera_wb=True,
-                # LibRaw's own histogram-based exposure compensation. With this
-                # disabled (the old no_auto_bright=True), RAWs rendered notably
-                # dark and flat compared to both the camera's own embedded JPEG
-                # and any other RAW viewer -- confirmed on a real library file,
-                # the old render averaged ~75% darker than the camera's JPEG.
-                # half-size preview decodes and full-size export decodes agree
-                # to within ~0.6% brightness, so this doesn't introduce a
-                # visible jump between the live preview and the exported file.
-                no_auto_bright=False,
+                no_auto_bright=True,  # brightness comes from _render_raw
+                gamma=(1, 1),
                 output_bps=16,
                 half_size=half_size,
             )
-        return rgb16.astype(np.float32) / 65535.0
+            preview_luma = _embedded_preview_luma(raw)
+        return _render_raw(rgb16, preview_luma)
     with Image.open(path) as img:
         # Pillow never auto-rotates on load -- without this, any photo shot in
         # portrait (or with the camera rotated) displays sideways.
@@ -98,9 +184,9 @@ def load_preview_float(path, max_dim: int = 1600) -> np.ndarray:
     if longest > max_dim:
         scale = max_dim / longest
         new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
-        img = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
-        img = img.resize((new_w, new_h), Image.BILINEAR)
-        arr = np.asarray(img).astype(np.float32) / 255.0
+        # Float area-average, not an 8-bit round trip: 8 bits left too few
+        # levels in the shadows for brightening them to stay smooth.
+        arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return arr
 
 

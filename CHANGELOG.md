@@ -18,16 +18,30 @@ git commits.
 
 ## [Unreleased]
 
-## [1.19.4] - 2026-10-03
+## [1.20.0] - 2026-10-03
+### Changed
+- RAW photos now open at the brightness the camera gave them, matched to
+  the camera's own JPEG, instead of being auto-brightened until their
+  brightest 1% turned white. That rule swung wildly with content: night
+  shots came out 3-20x too bright (grainy, with a maroon sky), and a moon
+  shot's moon was blown to a featureless white. Now the moon keeps its
+  surface detail on a black sky, night photos look like they did on the
+  camera, and the editor opens looking like the library and viewer, which
+  already show the camera's preview. Highlights roll off smoothly into
+  white instead of clipping. Edits saved earlier on RAWs will look a bit
+  different, since they now start from the new rendering.
+- The editor's preview is no longer squeezed through 8 bits on the way in,
+  so brightening shadows stays smooth.
+
 ### Fixed
 - Denoise did next to nothing on high-ISO photos: the red/blue colour
   blotching in a dark night sky was untouched even at 100. It now treats
   colour noise and grain separately and sets its strength from how noisy
   the photo actually is, so craters on a moon shot keep their detail and a
   clean photo's colours aren't smeared. In near-black areas it also
-  removes the red cast that high-ISO RAW noise leaves behind (a night sky
-  goes neutral instead of maroon). It runs before Sharpen instead of after
-  it, and an exported full-size photo comes out as clean as the preview.
+  removes the red cast that high-ISO RAW noise leaves behind. It runs
+  before Sharpen instead of after it, and an exported full-size photo
+  comes out as clean as the preview.
 
 ## [1.19.3] - 2026-10-02
 ### Added
