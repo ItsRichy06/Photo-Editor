@@ -18,6 +18,15 @@ git commits.
 
 ## [Unreleased]
 
+## [1.19.4] - 2026-10-03
+### Fixed
+- Denoise did next to nothing on high-ISO photos: the red/blue colour
+  blotching in a dark night sky was untouched even at 100. It now treats
+  colour noise and grain separately, sets its strength from how noisy the
+  photo actually is (so a clean photo's colours aren't smeared), runs
+  before Sharpen instead of after it, and an exported full-size photo now
+  comes out as clean as the preview showed.
+
 ## [1.19.3] - 2026-10-02
 ### Added
 - Move to (right-click): move the selected photos to any folder -- the

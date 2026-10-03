@@ -240,21 +240,86 @@ def apply_sharpen(img, amount):
     return src + a * 1.5 * (src - blurred)
 
 
-def apply_denoise(img, amount):
-    """Non-Local Means, not a bilateral filter: bilateral filtering was
-    leaving real per-pixel sensor grain largely intact while still softening
-    low-contrast detail (a mismatch between its small edge-preserving kernel
-    and what's needed to actually average out noise). NLM searches a much
-    wider neighborhood for similar patches, which removes noise far more
-    effectively -- verified directly: at matched settings it cut residual
-    noise ~85% vs bilateral's ~35%, with no measurable loss of edge sharpness
-    at the strengths this slider actually reaches."""
+DENOISE_REF_DIM = 2400  # long edge denoise is tuned at -- the editor preview's size
+
+
+def _noise_sigma(ch):
+    """Robust noise std of one channel: Immerkaer's Laplacian-difference
+    kernel cancels smooth gradients, and the median keeps real edges and
+    texture from inflating the estimate."""
+    k = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], np.float32)
+    return float(np.median(np.abs(cv2.filter2D(ch, -1, k)))) / 0.6745 / 6.0
+
+
+def _guided_filter(guide, src, r, eps):
+    """He et al.'s guided filter: smooths `src` over a (2r+1)^2 box but only
+    where `guide` is flat, so chroma can't bleed across a luminance edge."""
+    k = (2 * r + 1, 2 * r + 1)
+    m_i = cv2.boxFilter(guide, -1, k)
+    m_p = cv2.boxFilter(src, -1, k)
+    a = (cv2.boxFilter(guide * src, -1, k) - m_i * m_p) / (cv2.boxFilter(guide * guide, -1, k) - m_i * m_i + eps)
+    b = m_p - a * m_i
+    return cv2.boxFilter(a, -1, k) * guide + cv2.boxFilter(b, -1, k)
+
+
+def _denoise_lab(lab, t, scale):
+    """Denoises a float Lab image at (roughly) preview resolution. Returns
+    the result and the chroma weight used, so the full-res path can fade
+    the fine chroma band by the same amount."""
+    L, a, b = (np.ascontiguousarray(lab[..., i]) for i in range(3))
+    sig_l = _noise_sigma(L)
+    sig_c = max(_noise_sigma(a), _noise_sigma(b))
+    # Luma: NLM, its strength set from the measured grain so 100 means
+    # "remove about all of it" whether the photo is ISO 100 or ISO 6400.
+    h = t * min(max(sig_l * 2.55 * 1.6, 3.0), 30.0)
+    l8 = np.clip(L * 2.55, 0, 255).astype(np.uint8)
+    L = cv2.fastNlMeansDenoising(l8, None, h, 7, 21).astype(np.float32) / 2.55
+    # Chroma: high-ISO colour noise is coarse red/blue blotching that a 7px
+    # NLM patch can't see, so smooth a/b over a wide radius instead, guided
+    # by luma. Scaled by how much colour noise there actually is, so a clean
+    # photo's faint colour detail (thin pink clouds...) is left alone.
+    w = t * min(max((sig_c - 0.5) / 3.0, 0.0), 1.0)
+    if w > 0:
+        r = max(1, int(round((2 + 14 * t) * scale)))
+        eps = (max(sig_l, 0.5) * 2.0) ** 2
+        a = a + w * (_guided_filter(L, a, r, eps) - a)
+        b = b + w * (_guided_filter(L, b, r, eps) - b)
+    return cv2.merge([L, a, b]), w
+
+
+def apply_denoise(img, amount, scale=None):
+    """Luma/chroma-split denoise. `scale` is the SOURCE photo's long edge
+    over DENOISE_REF_DIM (before any crop), so a full-res export lands where
+    the preview did: a 24MP RAW's noise is coarser per pixel than the
+    downsized preview's, so above preview size the image is split in two
+    bands -- the coarse band denoised at preview scale (exactly what the
+    preview showed), the fine band soft-thresholded."""
     if amount <= 0:
         return img
-    h = (amount / 100.0) * 10.0
-    src_u8 = np.ascontiguousarray((np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8))
-    denoised_u8 = cv2.fastNlMeansDenoisingColored(src_u8, None, h, h, 7, 21)
-    return denoised_u8.astype(np.float32) / 255.0
+    t = min(amount, 100.0) / 100.0
+    if scale is None:
+        scale = max(img.shape[:2]) / DENOISE_REF_DIM
+    lab = cv2.cvtColor(np.clip(img, 0.0, 1.0).astype(np.float32), cv2.COLOR_RGB2Lab)
+    if scale <= 1.2:
+        out, _ = _denoise_lab(lab, t, scale)
+        return cv2.cvtColor(out, cv2.COLOR_Lab2RGB)
+
+    h0, w0 = lab.shape[:2]
+    size = (max(1, round(w0 / scale)), max(1, round(h0 / scale)))
+    small = cv2.resize(lab, size, interpolation=cv2.INTER_AREA)
+    small_d, w = _denoise_lab(small, t, 1.0)
+    detail = lab
+    detail -= cv2.resize(small, (w0, h0), interpolation=cv2.INTER_LINEAR)
+    del small
+    # Median first: isolated hot/cold pixels sit far above any threshold
+    # that keeps real texture, and a 3x3 median removes them but not edges.
+    d_l = np.ascontiguousarray(detail[..., 0])
+    d_l += t * (cv2.medianBlur(d_l, 3) - d_l)
+    thr = t * 1.5 * float(np.median(np.abs(d_l))) / 0.6745
+    detail[..., 0] = np.sign(d_l) * np.maximum(np.abs(d_l) - thr, 0.0)
+    detail[..., 1:] *= 1.0 - w
+    detail += cv2.resize(small_d, (w0, h0), interpolation=cv2.INTER_LINEAR)
+    return cv2.cvtColor(detail, cv2.COLOR_Lab2RGB)
 
 
 def is_identity_curve(points) -> bool:
@@ -406,8 +471,9 @@ def apply_recipe(img: np.ndarray, recipe: dict) -> np.ndarray:
     out = apply_channel_gains(out, recipe.get("red", 0.0), recipe.get("green", 0.0), recipe.get("blue", 0.0))
     out = apply_curves(out, recipe.get("curves"))
     out = apply_saturation_vibrance(out, recipe.get("saturation", 0.0), recipe.get("vibrance", 0.0))
+    # Denoise before sharpen, or sharpening amplifies the grain first.
+    out = apply_denoise(out, recipe.get("denoise", 0.0), scale=max(img.shape[:2]) / DENOISE_REF_DIM)
     out = apply_sharpen(out, recipe.get("sharpen", 0.0))
-    out = apply_denoise(out, recipe.get("denoise", 0.0))
     out = np.clip(out, 0.0, 1.0).astype(np.float32)
 
     local_layers = recipe.get("local_adjustments")
