@@ -1,25 +1,57 @@
-# Local dev environment -- regenerate with:
-#   python -m venv .venv && .venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv/
-
-# Self-contained embeddable Python bundled into the installer -- see README
-# ("rebuild the runtime + installer") for how to set this back up.
-runtime_build/
-
-# Built installer output (multi-GB, regenerate via Inno Setup)
-installer_output/
-
-# Python bytecode cache
+# Python
 __pycache__/
-*.pyc
-
-# Downloaded SAM2 model weights (~150MB) -- auto-downloaded on first AI
-# Select use and cached here; not source, no need to version it.
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 sam2_b.pt
 
-# Editor/OS cruft
-.vscode/
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
 .idea/
-.claude/
-Thumbs.db
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# OS
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# Project-specific
+*.db
+*.log
+catalog_backup_*
+installer_output/
+Scratches and Consoles/
+External Libraries/
+runtime_build/

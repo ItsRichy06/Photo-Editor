@@ -44,7 +44,7 @@ print("version parsing OK")
 print("=== _is_packaged_install ===")
 with mock.patch("sys.executable", r"C:\Users\Richard\AppData\Local\Programs\PhotoEditor\runtime\pythonw.exe"):
     assert updater._is_packaged_install() is True
-with mock.patch("sys.executable", r"C:\Users\Richard\Documents\Foto Editor\.venv\Scripts\python.exe"):
+with mock.patch("sys.executable", r"/\.venv\Scripts\python.exe"):
     assert updater._is_packaged_install() is False
 print("packaged-install detection OK")
 

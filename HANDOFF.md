@@ -166,7 +166,7 @@ forward rather than rediscovering:
   a timestamped filename rather than failing the whole publish over it.
 - **2026-08-28: rebranded "Foto Editor" -> "Photo Editor"** (source, window
   title, installer, docs -- everything except the actual project folder
-  path, which is still `Foto Editor` on disk on both the desktop and this
+  path, which is still `Photo Editor` on disk on both the desktop and this
   laptop copy; renaming a folder a live session is running out of is asking
   for trouble, so that was deliberately left alone). Two things about this
   that aren't obvious from a plain find-replace: the QSettings org/app name
